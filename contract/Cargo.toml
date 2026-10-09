@@ -1,0 +1,24 @@
+[package]
+name = "stellar-light-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+borsh = "1"
+near-sdk = "5.29"
+stellar-xdr = "28"
+verifier = { path = "../verifier" }
+
+[dev-dependencies]
+# `non-contract-usage` compiles env::ed25519_verify to a real ed25519-dalek
+# verification on native targets instead of the mock host shim, so tests
+# exercise genuine signature checking. The wasm build keeps the host function.
+near-sdk = { version = "5.29", features = ["unit-testing", "non-contract-usage"] }
+serde_json = "1"
+base64 = "0.22"
+
+[features]
+default = []

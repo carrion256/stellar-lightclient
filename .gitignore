@@ -1,0 +1,8 @@
+# Build artifacts (workspace target dirs)
+/target*/
+
+# Python
+__pycache__/
+
+# OS/editor noise
+.DS_Store
