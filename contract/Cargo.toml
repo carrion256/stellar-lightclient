@@ -11,14 +11,24 @@ borsh = "1"
 near-sdk = "5.29"
 stellar-xdr = "28"
 verifier = { path = "../verifier" }
+verify-core = { path = "../verify-core" }
 
 [dev-dependencies]
-# `non-contract-usage` compiles env::ed25519_verify to a real ed25519-dalek
-# verification on native targets instead of the mock host shim, so tests
-# exercise genuine signature checking. The wasm build keeps the host function.
-near-sdk = { version = "5.29", features = ["unit-testing", "non-contract-usage"] }
-serde_json = "1"
+anyhow = "1"
 base64 = "0.22"
+# `unit-testing` + `non-contract-usage`: native tests run env::ed25519_verify through
+# real ed25519-dalek instead of the mock shim. The wasm build keeps the host function.
+near-sdk = { version = "5.29", features = ["unit-testing", "non-contract-usage"] }
+# On-chain e2e: deploys the real wasm to a local neard sandbox (real alt_bn128 host
+# functions, real gas metering) — see tests/sandbox.rs.
+near-workspaces = "0.23"
+# near-workspaces -> near-jsonrpc-client defaults to native-tls, which needs OpenSSL
+# headers. Vendored builds it from source so this works on NixOS without system
+# OpenSSL paths. If you have system OpenSSL, drop this and set OPENSSL_DIR instead.
+openssl-sys = { version = "0.9", features = ["vendored"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = []

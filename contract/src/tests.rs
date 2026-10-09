@@ -450,3 +450,135 @@ fn update_wrapper_is_owner_only() {
     assert_eq!(wrapper.bn254_control_id.0, vec![0x44; 32]);
     assert!(client.is_wrapper_compatible(Base64VecU8(vec![0x33; 32]), Base64VecU8(vec![0x44; 32])));
 }
+
+// ---------------------------------------------- group 6: verify_claim + claim digests
+
+fn claim_test_journal() -> Vec<u8> {
+    verify_core::encode_journal(&verify_core::EpochJournal {
+        start_seq: 100,
+        start_hash: [0x0au8; 32],
+        end_seq: 528,
+        end_hash: [0x0bu8; 32],
+        claim_ids: vec![[0x0cu8; 32], [0x0du8; 32]],
+    })
+}
+
+/// Hex constants verified against the vendored risc0 crates (risc0-zkp 3.0.5
+/// `tagged_struct` + `Digest::ZERO`, risc0-zkvm 3.0.5 `ReceiptClaim::ok` shape) —
+/// see `verifier/src/claim.rs` for the algorithm and its source citations.
+fn digest32(hexs: &str) -> [u8; 32] {
+    let raw: Vec<u8> = (0..hexs.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hexs[i..i + 2], 16).unwrap())
+        .collect();
+    raw.try_into().unwrap()
+}
+
+#[test]
+fn claim_digest_and_journal_digest_match_risc0_vectors() {
+    // Vectors computed from the vendored risc0 crates (external check crate,
+    // main.rs asserts these same constants against risc0_binfmt::Digestible).
+    assert_eq!(
+        verifier::claim::journal_digest(b"hello epoch"),
+        digest32("7dc7d5a6956889d67fd16bf08b56a5e5e53a5936f0ec454e647fc99ba8dd10a4")
+    );
+    assert_eq!(
+        verifier::claim::ok_output_digest(b""),
+        digest32("836f175c62c0f353831665427e8b0b34f6d1d21902764daeb406c6b83db575b0")
+    );
+    let image_id = <[u8; 32]>::try_from((1u8..=32).collect::<Vec<u8>>()).unwrap();
+    assert_eq!(
+        verifier::claim::claim_digest(&verifier::claim::ok_claim(image_id, b"hello epoch")),
+        digest32("9c929b8f0688a358d07a0dc2846d994a4e6c10114eee62dc1e89e5fb1c34f029")
+    );
+}
+
+#[test]
+#[should_panic(expected = "unsupported RISC Zero wrapper: control_root not pinned")]
+fn verify_claim_with_wrong_control_root_is_rejected() {
+    let (client, _f) = fixture_client();
+    client.verify_claim(
+        Base64VecU8(vec![0u8; 256]),
+        Base64VecU8(vec![0x99; 32]),
+        Base64VecU8(vec![0u8; 32]),
+        Base64VecU8(vec![0x22; 32]),
+        Base64VecU8(Vec::new()),
+        Base64VecU8(Vec::new()),
+    );
+}
+
+#[test]
+#[should_panic(expected = "unsupported RISC Zero wrapper: bn254_control_id not pinned")]
+fn verify_claim_with_wrong_wrapper_id_is_rejected() {
+    let (client, _f) = fixture_client();
+    client.verify_claim(
+        Base64VecU8(vec![0u8; 256]),
+        Base64VecU8(vec![0x11; 32]),
+        Base64VecU8(vec![0u8; 32]),
+        Base64VecU8(vec![0x99; 32]),
+        Base64VecU8(Vec::new()),
+        Base64VecU8(Vec::new()),
+    );
+}
+
+#[test]
+fn verify_claim_accepts_structurally_valid_pair_and_reports_bad_proof() {
+    let (client, _f) = fixture_client();
+    let journal = claim_test_journal();
+    let image_id = [0x21u8; 32];
+    let claim = verifier::claim::ok_claim(image_id, &journal);
+
+    // Structurally consistent claim + journal, but the Groth16 proof is invalid:
+    // verify_claim must answer `verified: false`, never panic.
+    let evidence = client.verify_claim(
+        Base64VecU8(vec![0u8; 256]),
+        Base64VecU8(vec![0x11; 32]),
+        Base64VecU8(verifier::claim::claim_digest(&claim).to_vec()),
+        Base64VecU8(vec![0x22; 32]),
+        Base64VecU8(claim.encode()),
+        Base64VecU8(journal.clone()),
+    );
+    assert!(!evidence.verified, "zero seal is not a valid Groth16 proof");
+    // The journal is still decoded and reported for the caller.
+    assert_eq!(evidence.end_seq, 528);
+    assert_eq!(evidence.end_hash.0, vec![0x0bu8; 32]);
+    assert_eq!(evidence.claim_ids, vec![Base64VecU8(vec![0x0c; 32]), Base64VecU8(vec![0x0d; 32])]);
+}
+
+#[test]
+fn verify_claim_rejects_claim_digest_mismatch() {
+    let (client, _f) = fixture_client();
+    let journal = claim_test_journal();
+    let claim = verifier::claim::ok_claim([0x21u8; 32], &journal);
+
+    // The claim bytes do not digest to the claim_digest public input.
+    let evidence = client.verify_claim(
+        Base64VecU8(vec![0u8; 256]),
+        Base64VecU8(vec![0x11; 32]),
+        Base64VecU8(vec![0u8; 32]),
+        Base64VecU8(vec![0x22; 32]),
+        Base64VecU8(claim.encode()),
+        Base64VecU8(journal),
+    );
+    assert!(!evidence.verified, "claim must digest to the claim_digest public input");
+}
+
+#[test]
+fn verify_claim_rejects_journal_not_matching_claim_output() {
+    let (client, _f) = fixture_client();
+    let journal = claim_test_journal();
+    let claim = verifier::claim::ok_claim([0x21u8; 32], &journal);
+
+    let mut tampered = journal.clone();
+    tampered[0] ^= 0x01;
+    // claim_digest binds the real journal; the supplied journal bytes don't match.
+    let evidence = client.verify_claim(
+        Base64VecU8(vec![0u8; 256]),
+        Base64VecU8(vec![0x11; 32]),
+        Base64VecU8(verifier::claim::claim_digest(&claim).to_vec()),
+        Base64VecU8(vec![0x22; 32]),
+        Base64VecU8(claim.encode()),
+        Base64VecU8(tampered),
+    );
+    assert!(!evidence.verified, "journal must hash into the claim's output");
+}

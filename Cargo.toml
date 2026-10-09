@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["contract", "tools/xtask", "tools/groth16-fixture", "verifier"]
+members = ["contract", "tools/xtask", "tools/groth16-fixture", "verifier", "verify-core", "guest"]
 
 [workspace.package]
 edition = "2021"

@@ -15,6 +15,7 @@
 
 pub mod bn128;
 pub mod groth16;
+pub mod claim;
 pub mod risc0;
 
 pub use bn128::{Fr, G1, G2};

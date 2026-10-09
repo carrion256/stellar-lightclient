@@ -30,18 +30,35 @@
 #[cfg(test)]
 mod tests;
 
-use std::io::Cursor;
-
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::json_types::Base64VecU8;
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{env, near, require, AccountId, PanicOnDefault};
 
-use stellar_xdr::{
-    EnvelopeType, GeneralizedTransactionSet, Hash, LedgerHeader, Limited, Limits, PublicKey,
-    ReadXdr, ScpEnvelope, ScpStatementPledges, Signature, StellarValue, TransactionEnvelope,
-    TransactionPhase, TransactionSet, TxSetComponent, Value, WriteXdr,
-};
+#[cfg(test)]
+use std::io::Cursor;
+
+#[cfg(test)]
+use stellar_xdr::{LedgerHeader, Limited, Limits, PublicKey, ReadXdr, ScpEnvelope,
+ScpStatementPledges, WriteXdr};
+
+use verify_core::{Crypto, Error};
+
+/// Near host functions behind `verify_core::Crypto` — the only crypto the shared
+/// core needs; everything else in `verify_core::verify_span` is host-agnostic.
+struct NearCrypto;
+
+impl Crypto for NearCrypto {
+    fn sha256(&self, bytes: &[u8]) -> [u8; 32] {
+        env::sha256(bytes)
+            .try_into()
+            .unwrap_or_else(|_| env::panic_str("sha256 output is not 32 bytes"))
+    }
+
+    fn ed25519_verify(&self, signature: &[u8; 64], message: &[u8], public_key: &[u8; 32]) -> bool {
+        env::ed25519_verify(signature, message, public_key)
+    }
+}
 
 // --------------------------------------------------------------- JSON call arguments
 
@@ -133,6 +150,27 @@ pub struct ReceiptEvidence {
 pub struct WrapperView {
     pub control_root: Base64VecU8,
     pub bn254_control_id: Base64VecU8,
+}
+
+/// Outcome of verifying one RISC Zero Groth16 receipt **and** the claim it proves,
+/// read out of the journal the guest committed.
+///
+/// `verified: false` (rather than a panic) for any proof/binding failure; the
+/// wrapper pinning and length rules panic exactly like [`ReceiptEvidence`]. When
+/// unverified, `journal`/`claim_digest` echo the input and `end_seq`/`end_hash`/
+/// `claim_ids` are zeroed — callers must branch on `verified` first.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct ClaimEvidence {
+    pub verified: bool,
+    /// Claim digest the proof was verified against (echo of the public input).
+    pub claim_digest: Base64VecU8,
+    /// The guest's committed output, echoed back for the caller.
+    pub journal: Base64VecU8,
+    pub end_seq: u32,
+    pub end_hash: Base64VecU8,
+    /// sha256(tx envelope) per settled deposit, as committed by the guest.
+    pub claim_ids: Vec<Base64VecU8>,
 }
 
 #[near(contract_state)]
@@ -291,8 +329,10 @@ impl LightClient {
         }
     }
 
-    /// Chain-walk the span, verify the tail certificate and (if supplied) the tail
-    /// transaction set, then prove any claims against that set.
+    /// Chain-walk, tail certificate, transaction-set pinning, and claim proofs run
+    /// in `verify_core::verify_span` — the host-agnostic core shared with the guest
+    /// (no private copy of this logic here). Failures map 1:1 onto the panic
+    /// messages this contract has always used.
     #[allow(clippy::too_many_arguments)]
     fn verify_span_core(
         &self,
@@ -303,84 +343,66 @@ impl LightClient {
         tail_set: Option<&[u8]>,
         claims: &[(&[u8], u32)],
     ) -> SpanEvidence {
-        require!(!headers.is_empty(), "span needs at least the tail header");
-
-        // 1) the headers form a chain from the starting head to the tail.
-        let mut prev_seq = start_seq;
-        let mut prev_hash = start_hash;
-        let mut pinned_by_set = start_hash;
-        let mut tail: Option<(LedgerHeader, [u8; 32])> = None;
-        for (i, raw) in headers.iter().enumerate() {
-            let header: LedgerHeader = decode(raw, "ledger header");
-            require!(header.ledger_seq == prev_seq + 1, "unexpected ledger sequence");
-            require!(
-                header.previous_ledger_hash.0 == prev_hash,
-                "header previous ledger hash mismatch"
-            );
-            let hash: [u8; 32] = env::sha256(raw)
-                .try_into()
-                .unwrap_or_else(|_| env::panic_str("sha256 output is not 32 bytes"));
-            let seq = header.ledger_seq;
-            if i + 1 == headers.len() {
-                // `prev_hash` is the point the tail set must pin.
-                pinned_by_set = prev_hash;
-                tail = Some((header, hash));
+        let proof = verify_core::SpanProof {
+            headers,
+            tail_envelopes,
+            tail_set,
+            claims,
+        };
+        let trust = verify_core::Trust {
+            network_id: self.network_id,
+            trusted_nodes: self.trusted_nodes.clone(),
+            threshold: self.threshold,
+            max_protocol_version: self.max_protocol_version,
+        };
+        let outcome = match verify_core::verify_span(&NearCrypto, &trust, start_seq, start_hash, &proof) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The core's Display prefix for every variant is exactly the
+                // message this contract panicked with before the split (extra
+                // context follows after " — ", appended by the core, not here).
+                let message = match error {
+                    Error::EmptySpan => "span needs at least the tail header",
+                    Error::InvalidHeaderXdr { .. } => "invalid ledger header xdr",
+                    Error::UnexpectedLedgerSeq { .. } => "unexpected ledger sequence",
+                    Error::PreviousLedgerHashMismatch { .. } => "header previous ledger hash mismatch",
+                    Error::ProtocolVersionExceeded { .. } => {
+                        "ledger protocol version is beyond the supported maximum"
+                    }
+                    Error::InvalidEnvelopeXdr { .. } => "invalid scp envelope xdr",
+                    Error::InvalidStellarValueXdr { .. } => "invalid stellar value xdr",
+                    Error::ExternalizedValueMismatch { .. } => {
+                        "externalized value differs from the header scp value"
+                    }
+                    Error::InvalidSignatureLength { .. } => "signature is not 64 bytes",
+                    Error::InvalidValidatorSignature { .. } => "invalid validator signature",
+                    Error::QuorumNotReached { .. } => "quorum threshold not met",
+                    Error::NoExternalizeStatement => "no externalize statement for ledger",
+                    Error::TxSetHashMismatch => "transaction set does not hash to the signed value",
+                    Error::TxSetTooShort => "transaction set is too short",
+                    Error::InvalidTxSetXdr => "invalid transaction set xdr",
+                    Error::NonCanonicalTxSet => "transaction set is not canonical xdr",
+                    Error::TxSetPreviousLedgerHashMismatch => "tx set previous ledger hash mismatch",
+                    Error::ClaimsRequireTxSet => "claims require the tail transaction set",
+                    Error::ClaimIndexOutOfRange { .. } => "claimed tx index is out of range",
+                    Error::ClaimEnvelopeMismatch { .. } => {
+                        "claimed tx envelope is not the element at that index"
+                    }
+                    Error::MalformedJournal(_) => "invalid epoch journal encoding",
+                };
+                env::panic_str(message);
             }
-            prev_seq = seq;
-            prev_hash = hash;
-        }
-        let (tail_header, tail_hash) = tail.unwrap_or_else(|| env::panic_str("no tail header"));
-        require!(
-            tail_header.ledger_version <= self.max_protocol_version,
-            "ledger protocol version is beyond the supported maximum"
-        );
-
-        // 2) a quorum of trusted nodes externalized exactly the tail header's SCP value.
-        let (signed_value, quorum_signers) = self.check_quorum(&tail_header, tail_envelopes);
-
-        // 3) the signed value commits to the tail's transaction set ...
-        let mut pinned_seq = None;
-        let mut txs: Vec<TransactionEnvelope> = Vec::new();
-        if let Some(set) = tail_set {
-            require!(
-                env::sha256(set) == signed_value.tx_set_hash.0,
-                "transaction set does not hash to the signed value"
-            );
-            // ... and the set pins the previous header, which pins the chain backwards.
-            let set_prev = if claims.is_empty() {
-                tx_set_prev_hash(set)
-            } else {
-                let (prev, list) = parse_tx_set(set);
-                txs = list;
-                prev.0
-            };
-            require!(set_prev == pinned_by_set, "tx set previous ledger hash mismatch");
-            pinned_seq = Some(prev_seq - 1);
-        }
-
-        // 4) claims need the set: inclusion cannot be proven without it.
-        require!(
-            claims.is_empty() || tail_set.is_some(),
-            "claims require the tail transaction set"
-        );
-        let mut claimed_tx_ids = Vec::with_capacity(claims.len());
-        for (envelope_bytes, index) in claims {
-            let idx = *index as usize;
-            require!(idx < txs.len(), "claimed tx index is out of range");
-            let encoded = encode(&txs[idx]);
-            require!(
-                encoded == *envelope_bytes,
-                "claimed tx envelope is not the element at that index"
-            );
-            claimed_tx_ids.push(Base64VecU8(env::sha256(&encoded).to_vec()));
-        }
-
+        };
         SpanEvidence {
-            tail_seq: tail_header.ledger_seq,
-            tail_hash: Base64VecU8(tail_hash.to_vec()),
-            pinned_seq,
-            quorum_signers,
-            claimed_tx_ids,
+            tail_seq: outcome.tail_seq,
+            tail_hash: Base64VecU8(outcome.tail_hash.to_vec()),
+            pinned_seq: outcome.pinned_seq,
+            quorum_signers: outcome.quorum_signers,
+            claimed_tx_ids: outcome
+                .claim_ids
+                .iter()
+                .map(|id| Base64VecU8(id.to_vec()))
+                .collect(),
         }
     }
 
@@ -434,15 +456,20 @@ impl LightClient {
         let bn254_control_id = to32(&bn254_control_id, "bn254_control_id");
         // Reject unknown wrapper builds before touching the proof. The verifying key
         // is RISC Zero's STARK→SNARK wrapper key, so the wrapper build is the trust
-        // anchor: a receipt is only meaningful if we accept that wrapper.
-        require!(
-            control_root == self.control_root,
-            "unsupported RISC Zero wrapper: control_root not pinned"
-        );
-        require!(
-            bn254_control_id == self.bn254_control_id,
-            "unsupported RISC Zero wrapper: bn254_control_id not pinned"
-        );
+        // anchor: a receipt is only meaningful if we accept that wrapper. Fail with
+        // `env::panic_str` directly (not `require!`) so the reason is always a
+        // `GuestPanic` message a caller can read, never a bare wasm trap.
+        if control_root != self.control_root {
+            // Log the reason explicitly: depending on near-sdk's panic plumbing the
+            // failure surfaces as a GuestPanic message or as a bare wasm trap, and a
+            // caller must always be able to tell why their receipt was refused.
+            env::log_str("unsupported RISC Zero wrapper: control_root not pinned");
+            env::panic_str("unsupported RISC Zero wrapper: control_root not pinned");
+        }
+        if bn254_control_id != self.bn254_control_id {
+            env::log_str("unsupported RISC Zero wrapper: bn254_control_id not pinned");
+            env::panic_str("unsupported RISC Zero wrapper: bn254_control_id not pinned");
+        }
         let seal = seal.0;
         require!(seal.len() == 256, "seal must be 256 bytes");
 
@@ -461,65 +488,106 @@ impl LightClient {
         }
     }
 
-    /// Verify signatures of trusted nodes externalizing exactly the header's SCP value.
-    /// One pass; stops as soon as the threshold is met.
-    fn check_quorum(
+    /// Verify a RISC Zero Groth16 receipt **and** bind it to the claim the guest
+    /// proved: the supplied `claim` bytes must digest (with
+    /// `verifier::claim::claim_digest`) to the `claim_digest` public input, and the
+    /// supplied `journal` must hash into the claim's output. Returns the epoch journal
+    /// contents so a bridge can read the settled deposits.
+    ///
+    /// Panics on malformed lengths and on an unpinned wrapper (same reason strings as
+    /// [`verify_receipt`]); a structurally-valid but cryptographically-bad proof
+    /// returns `verified: false` rather than panicking, per [`ReceiptEvidence`].
+    /// The same applies to claim/journal binding failures: a valid receipt whose
+    /// claim or journal doesn't match is reported via `verified: false`, never as a
+    /// panic, so the evidence value itself is the verdict.
+    pub fn verify_claim(
         &self,
-        header: &LedgerHeader,
-        envelopes: &[&[u8]],
-    ) -> (StellarValue, u32) {
-        let mut counted: Vec<[u8; 32]> = Vec::new();
-        let mut value: Option<StellarValue> = None;
-        for raw in envelopes {
-            let envelope: ScpEnvelope = decode(raw, "scp envelope");
-            let statement = &envelope.statement;
-            if statement.slot_index != u64::from(header.ledger_seq) {
-                continue; // witness for a different slot
-            }
-            let ScpStatementPledges::Externalize(ext) = &statement.pledges else {
-                continue; // only EXTERNALIZE finalizes a value
-            };
+        seal: Base64VecU8,
+        control_root: Base64VecU8,
+        claim_digest: Base64VecU8,
+        bn254_control_id: Base64VecU8,
+        claim: Base64VecU8,
+        journal: Base64VecU8,
+    ) -> ClaimEvidence {
+        // 1) digest conversion.
+        let control_root = to32(&control_root, "control_root");
+        let claim_digest = to32(&claim_digest, "claim_digest");
+        let bn254_control_id = to32(&bn254_control_id, "bn254_control_id");
+        let seal = seal.0;
 
-            // The externalized value must be exactly the header's SCP value.
-            let externalized: StellarValue = decode(value_bytes(&ext.commit.value), "stellar value");
-            require!(
-                externalized == header.scp_value,
-                "externalized value differs from the header scp value"
-            );
-            value = Some(externalized);
-
-            let PublicKey::PublicKeyTypeEd25519(key) = &statement.node_id.0;
-            let node_id = key.0;
-            if counted.contains(&node_id) {
-                continue; // one vote per node
-            }
-            if !self.trusted_nodes.contains(&node_id) {
-                continue; // not part of the pinned trust set
-            }
-
-            // stellar-core: signature = sign(xdr(networkID, ENVELOPE_TYPE_SCP, statement))
-            let statement_xdr = encode(statement);
-            let mut message = Vec::with_capacity(32 + 4 + statement_xdr.len());
-            message.extend_from_slice(&self.network_id);
-            message.extend_from_slice(&(EnvelopeType::Scp as i32).to_be_bytes());
-            message.extend_from_slice(&statement_xdr);
-
-            let signature = signature_bytes(&envelope.signature);
-            require!(
-                env::ed25519_verify(&signature, &message, &node_id),
-                "invalid validator signature"
-            );
-
-            counted.push(node_id);
-            if counted.len() as u32 >= self.threshold {
-                break;
-            }
+        // 2) wrapper pinning — identical rejection to verify_receipt, same strings.
+        // The wrapper build is the trust anchor, so unknown wrappers are refused
+        // before any payload length is even inspected.
+        if control_root != self.control_root {
+            env::log_str("unsupported RISC Zero wrapper: control_root not pinned");
+            env::panic_str("unsupported RISC Zero wrapper: control_root not pinned");
         }
-        let signers = counted.len() as u32;
-        require!(signers >= self.threshold, "quorum threshold not met");
-        let value = value.unwrap_or_else(|| env::panic_str("no externalize statement for ledger"));
-        (value, signers)
+        if bn254_control_id != self.bn254_control_id {
+            env::log_str("unsupported RISC Zero wrapper: bn254_control_id not pinned");
+            env::panic_str("unsupported RISC Zero wrapper: bn254_control_id not pinned");
+        }
+
+        // 3) malformed lengths panic; nothing else in this call is a caller error.
+        require!(seal.len() == 256, "seal must be 256 bytes");
+        require!(
+            claim.0.len() == 104,
+            "receipt claim must be 104 bytes (see verifier::claim::ReceiptClaim)"
+        );
+
+        // 4) Groth16 — a bad proof is reported, not thrown.
+        let inputs = verifier::risc0::public_inputs(control_root, claim_digest, bn254_control_id);
+        let verified = match verifier::risc0::seal_to_proof(&seal) {
+            Ok(proof) => {
+                verifier::groth16::verify(&verifier::risc0::verifying_key(), &proof, &inputs)
+            }
+            Err(_) => false,
+        };
+
+        // 5) the claim bytes must digest to the claim_digest public input.
+        let claim = verifier::claim::ReceiptClaim::decode(&claim.0)
+            .unwrap_or_else(|e| env::panic_str(&e));
+        let verified = verified && claim_digest == verifier::claim::claim_digest(&claim);
+
+        // 6) the journal must hash into the claim's output (risc0 `Output` tagged
+        // digest over `journal_digest(journal)` + empty assumptions).
+        let verified = verified
+            && claim.output == Some(verifier::claim::ok_output_digest(&journal.0));
+
+        // 7) decode the journal so the evidence always reports what it claims.
+        // A decode failure panics only when `verified == true`: the journal is
+        // cryptographically bound then, so it is a caller/encoding error. An
+        // unverified journal is unbound input and must never panic; it yields
+        // empty epoch fields instead.
+        let epoch = match verify_core::decode_journal(&journal.0) {
+            Ok(epoch) => Some(epoch),
+            Err(error) => {
+                if verified {
+                    env::panic_str(&error.to_string())
+                } else {
+                    None
+                }
+            }
+        };
+        ClaimEvidence {
+            verified,
+            claim_digest: Base64VecU8(claim_digest.to_vec()),
+            journal: Base64VecU8(journal.0),
+            end_seq: epoch.as_ref().map_or(0, |epoch| epoch.end_seq),
+            end_hash: Base64VecU8(
+                epoch
+                    .as_ref()
+                    .map_or_else(Vec::new, |epoch| epoch.end_hash.to_vec()),
+            ),
+            claim_ids: epoch.map_or_else(Vec::new, |epoch| {
+                epoch
+                    .claim_ids
+                    .iter()
+                    .map(|id| Base64VecU8(id.to_vec()))
+                    .collect()
+            }),
+        }
     }
+
 }
 
 // ---------------------------------------------------------------- decoding helpers
@@ -528,17 +596,17 @@ fn slices(items: &[Base64VecU8]) -> Vec<&[u8]> {
     items.iter().map(|i| i.0.as_slice()).collect()
 }
 
+// Test fixture codec: the tests forge/tamper XDR payloads with these. The span
+// verification logic itself lives in `verify_core`; production code no longer
+// parses XDR at all.
+#[cfg(test)]
 fn decode<T: ReadXdr>(bytes: &[u8], what: &str) -> T {
     let mut reader = Limited::new(Cursor::new(bytes), Limits::none());
     T::read_xdr_to_end(&mut reader)
         .unwrap_or_else(|_| env::panic_str(&format!("invalid {what} xdr")))
 }
 
-fn try_decode<T: ReadXdr>(bytes: &[u8]) -> Option<T> {
-    let mut reader = Limited::new(Cursor::new(bytes), Limits::none());
-    T::read_xdr_to_end(&mut reader).ok()
-}
-
+#[cfg(test)]
 fn encode<T: WriteXdr>(value: &T) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut writer = Limited::new(&mut buf, Limits::none());
@@ -546,79 +614,6 @@ fn encode<T: WriteXdr>(value: &T) -> Vec<u8> {
         .write_xdr(&mut writer)
         .unwrap_or_else(|_| env::panic_str("xdr encoding failed"));
     buf
-}
-
-/// Read `previousLedgerHash` from a transaction set without decoding the set.
-///
-/// ponytail: the set kind is inferred from the XDR union discriminant (4 bytes) instead
-/// of parsing every transaction envelope — a 341 KiB set of ~385 envelopes reduced to a
-/// 36-byte read. The sha256 check pins these bytes to the signed value and the chain
-/// check pins the hash, so misreading the kind fails closed (it can only reject), with
-/// the theoretical exception of a 2^-32 prefix collision. Upgrade path: [`parse_tx_set`],
-/// which is exact and already used whenever claims are present.
-fn tx_set_prev_hash(bytes: &[u8]) -> [u8; 32] {
-    require!(bytes.len() >= 36, "transaction set is too short");
-    let discriminant = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let offset = if discriminant == 1 {
-        4 // GeneralizedTransactionSet: union discriminant precedes TransactionSetV1
-    } else {
-        0 // TransactionSet starts with the hash
-    };
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes[offset..offset + 32]);
-    out
-}
-
-/// Split a transaction set into its `previousLedgerHash` and its transactions.
-///
-/// Both encodings start with that hash: `TransactionSet` directly, and
-/// `GeneralizedTransactionSet` after the union discriminant. Whichever type
-/// re-encodes byte-identically is the one the network hashed.
-fn parse_tx_set(bytes: &[u8]) -> (Hash, Vec<TransactionEnvelope>) {
-    if let Some(set) = try_decode::<GeneralizedTransactionSet>(bytes) {
-        if encode(&set) == bytes {
-            let GeneralizedTransactionSet::V1(v1) = &set;
-            let mut txs = Vec::new();
-            for phase in v1.phases.iter() {
-                match phase {
-                    TransactionPhase::V0(components) => {
-                        for component in components.iter() {
-                            let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
-                                component;
-                            txs.extend(component.txs.iter().cloned());
-                        }
-                    }
-                    TransactionPhase::V1(component) => {
-                        // Parallel phase: stages of dependent-tx clusters, flattened in
-                        // serialization order so indices match the set as hashed.
-                        for stage in component.execution_stages.iter() {
-                            for cluster in stage.0.iter() {
-                                txs.extend(cluster.0.iter().cloned());
-                            }
-                        }
-                    }
-                }
-            }
-            return (v1.previous_ledger_hash.clone(), txs);
-        }
-    }
-    let set: TransactionSet = decode(bytes, "transaction set");
-    require!(encode(&set) == bytes, "transaction set is not canonical xdr");
-    (
-        set.previous_ledger_hash.clone(),
-        set.txs.iter().cloned().collect(),
-    )
-}
-
-fn value_bytes(value: &Value) -> &[u8] {
-    value.0.as_slice()
-}
-
-fn signature_bytes(signature: &Signature) -> [u8; 64] {
-    let Ok(sig) = <[u8; 64]>::try_from(signature.0.as_slice()) else {
-        env::panic_str("signature is not 64 bytes")
-    };
-    sig
 }
 
 fn to32(value: &Base64VecU8, what: &str) -> [u8; 32] {
