@@ -13,7 +13,7 @@ use verify_core::{trust_digest, validate_trust, Crypto, Error, Trust};
 use guest::{run_epoch, EpochInput, Sha256Dalek, SpanInput};
 use verify_core::{decode_journal, encode_journal};
 
-const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/fixture.json");
+const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../testdata/fixture.json");
 
 fn fixture() -> Value {
     let raw = std::fs::read_to_string(FIXTURE_PATH)

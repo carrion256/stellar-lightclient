@@ -1,45 +1,13 @@
-[package]
-name = "guest"
-version = "0.1.0"
-edition = "2021"
-
-# RISC Zero guest program. Natively `cargo test`-able: the zkVM entrypoint is
-# behind the OFF-by-default `zkvm-entrypoint` feature, so plain builds and tests
-# on this box (no rzup/cargo-risczero) never resolve `risc0-zkvm`.
-
-[dependencies]
-verify-core = { path = "../verify-core" }
-sha2 = "0.10"
-ed25519-dalek = "2"
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
-
-# Pinned to the 3.0.x line the NEAR contract's Groth16 verifying key was
-# transcribed from: a guest proven with the 5.x toolchain produces a different
-# bn254_control_id and the contract's wrapper pinning rejects the receipt.
-# Guest and verifier MUST be the same RISC Zero release.
-risc0-zkvm = { version = "3.0.5", optional = true }
-
-[dev-dependencies]
-serde_json = "1"
-base64 = "0.22"
-# Threshold computation in tests decodes real SCP envelopes, exactly like
-# `contract/src/tests.rs::trust_set_and_externalizers` does.
-stellar-xdr = "28"
-
-[features]
-default = []
-zkvm-entrypoint = ["dep:risc0-zkvm"]
-
-[[bin]]
-name = "guest"
-path = "src/bin/guest.rs"
-# Cargo skips this target entirely unless the feature is on, so native
-# `cargo test -p guest` works without the RISC Zero toolchain.
-required-features = ["zkvm-entrypoint"]
-
-# Standalone workspace: `cargo risczero build` compiles the guest with
-# `--manifest-path guest/Cargo.toml --locked`, which requires a lockfile next
-# to this manifest. Without it the docker build resolves dependencies freely
-# (it picked bincode 2 against bincode-1 API code) and is not reproducible.
+# Workspace root for the RISC Zero side.
+#
+# `methods` is the canonical risc0 "methods" crate: its build.rs compiles the
+# `guest` program and embeds the ELF + image id as Rust constants. risc0-build
+# resolves each guest as `<methods crate>/<guest name>/Cargo.toml`, which is why
+# the guest lives at `methods/guest/`.
+#
+# `methods/guest` is its own workspace (it has a `[workspace]` table and its own
+# lockfile) because `cargo risczero build` compiles it standalone with
+# `--manifest-path ... --locked`. A nested workspace must be excluded here.
 [workspace]
+members = ["methods"]
+exclude = ["methods/guest"]
