@@ -112,6 +112,9 @@ fn client_before(
         99,
         num(&first["ledger_seq"]) - 1,
         b64(&first["tx_set_previous_ledger_hash_b64"]),
+        // Pinned RISC Zero wrapper identity for the tests (arbitrary but fixed).
+        Base64VecU8(vec![0x11u8; 32]),
+        Base64VecU8(vec![0x22u8; 32]),
     )
 }
 
@@ -381,4 +384,69 @@ fn wrong_claim_index_is_rejected() {
     // Claim the fixture's transaction at a different index.
     let wrong = if claimed == 0 { 1 } else { 0 };
     client.submit_span(span_proof(&close, Some(wrong)));
+}
+
+// ------------------------------------------------ group 5: wrapper pinning
+
+#[test]
+fn wrapper_info_reports_pinned_identity() {
+    let (client, _f) = fixture_client();
+    let wrapper = client.get_wrapper();
+    assert_eq!(wrapper.control_root.0, vec![0x11u8; 32]);
+    assert_eq!(wrapper.bn254_control_id.0, vec![0x22u8; 32]);
+    // Compatibility is checkable by anyone, without submitting anything.
+    assert!(client.is_wrapper_compatible(Base64VecU8(vec![0x11; 32]), Base64VecU8(vec![0x22; 32])));
+    assert!(!client.is_wrapper_compatible(Base64VecU8(vec![0x11; 32]), Base64VecU8(vec![0x23; 32])));
+    assert!(!client.is_wrapper_compatible(Base64VecU8(vec![0x12; 32]), Base64VecU8(vec![0x22; 32])));
+}
+
+#[test]
+#[should_panic(expected = "unsupported RISC Zero wrapper: control_root not pinned")]
+fn receipt_with_wrong_control_root_is_rejected() {
+    let (client, _f) = fixture_client();
+    client.verify_receipt(
+        Base64VecU8(vec![0u8; 256]),
+        Base64VecU8(vec![0x99; 32]),
+        Base64VecU8(vec![0u8; 32]),
+        Base64VecU8(vec![0x22; 32]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "unsupported RISC Zero wrapper: bn254_control_id not pinned")]
+fn receipt_with_wrong_wrapper_id_is_rejected() {
+    let (client, _f) = fixture_client();
+    client.verify_receipt(
+        Base64VecU8(vec![0u8; 256]),
+        Base64VecU8(vec![0x11; 32]),
+        Base64VecU8(vec![0u8; 32]),
+        Base64VecU8(vec![0x99; 32]),
+    );
+}
+
+#[test]
+fn update_wrapper_is_owner_only() {
+    let (mut client, _f) = fixture_client();
+    // A non-owner cannot rotate the wrapper identity.
+    testing_env!(
+        VMContextBuilder::new()
+            .predecessor_account_id("mallory.near".parse().unwrap())
+            .build()
+    );
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.update_wrapper(Base64VecU8(vec![0x33; 32]), Base64VecU8(vec![0x44; 32]));
+    }));
+    assert!(rejected.is_err(), "non-owner must not rotate the wrapper");
+
+    // The owner can, and the public view reflects the new identity.
+    testing_env!(
+        VMContextBuilder::new()
+            .predecessor_account_id("lc.near".parse().unwrap())
+            .build()
+    );
+    client.update_wrapper(Base64VecU8(vec![0x33; 32]), Base64VecU8(vec![0x44; 32]));
+    let wrapper = client.get_wrapper();
+    assert_eq!(wrapper.control_root.0, vec![0x33; 32]);
+    assert_eq!(wrapper.bn254_control_id.0, vec![0x44; 32]);
+    assert!(client.is_wrapper_compatible(Base64VecU8(vec![0x33; 32]), Base64VecU8(vec![0x44; 32])));
 }

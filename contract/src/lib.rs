@@ -126,6 +126,15 @@ pub struct ReceiptEvidence {
     pub control_root: Base64VecU8,
 }
 
+/// The RISC Zero wrapper build this contract accepts — readable by anyone so a
+/// caller can check compatibility before submitting a receipt.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct WrapperView {
+    pub control_root: Base64VecU8,
+    pub bn254_control_id: Base64VecU8,
+}
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct LightClient {
@@ -137,6 +146,12 @@ pub struct LightClient {
     pub max_protocol_version: u32,
     pub head_seq: u32,
     pub head_hash: [u8; 32],
+    /// Pinned RISC Zero wrapper identity. The Groth16 verifying key belongs to
+    /// RISC Zero's STARK→SNARK wrapper (universal across guest circuits for one
+    /// wrapper build), so the wrapper build is what must be pinned: receipts whose
+    /// `control_root` / `bn254_control_id` differ are rejected up front.
+    pub control_root: [u8; 32],
+    pub bn254_control_id: [u8; 32],
 }
 
 #[near]
@@ -150,6 +165,8 @@ impl LightClient {
         max_protocol_version: u32,
         head_seq: u32,
         head_hash: Base64VecU8,
+        control_root: Base64VecU8,
+        bn254_control_id: Base64VecU8,
     ) -> Self {
         require!(threshold > 0, "threshold must be positive");
         require!(
@@ -164,6 +181,8 @@ impl LightClient {
             max_protocol_version,
             head_seq,
             head_hash: to32(&head_hash, "head_hash"),
+            control_root: to32(&control_root, "control_root"),
+            bn254_control_id: to32(&bn254_control_id, "bn254_control_id"),
         }
     }
 
@@ -365,6 +384,40 @@ impl LightClient {
         }
     }
 
+    /// The RISC Zero wrapper build this contract accepts — readable by anyone, so a
+    /// caller can check compatibility before spending gas on a receipt.
+    pub fn get_wrapper(&self) -> WrapperView {
+        WrapperView {
+            control_root: Base64VecU8(self.control_root.to_vec()),
+            bn254_control_id: Base64VecU8(self.bn254_control_id.to_vec()),
+        }
+    }
+
+    /// Would a receipt from this wrapper build be accepted? Reads nothing else and
+    /// writes nothing: pure compatibility check against the pinned identity.
+    pub fn is_wrapper_compatible(
+        &self,
+        control_root: Base64VecU8,
+        bn254_control_id: Base64VecU8,
+    ) -> bool {
+        let Ok(control_root) = <[u8; 32]>::try_from(control_root.0.as_slice()) else {
+            return false;
+        };
+        let Ok(bn254_control_id) = <[u8; 32]>::try_from(bn254_control_id.0.as_slice()) else {
+            return false;
+        };
+        control_root == self.control_root && bn254_control_id == self.bn254_control_id
+    }
+
+    /// Owner-only: rotate the accepted wrapper identity. Needed because a RISC Zero
+    /// wrapper upgrade changes the verifying key — without this the contract would be
+    /// permanently bound to one wrapper build.
+    pub fn update_wrapper(&mut self, control_root: Base64VecU8, bn254_control_id: Base64VecU8) {
+        require!(env::predecessor_account_id() == self.owner, "owner only");
+        self.control_root = to32(&control_root, "control_root");
+        self.bn254_control_id = to32(&bn254_control_id, "bn254_control_id");
+    }
+
     /// Verify a RISC Zero Groth16 receipt and return what it proves.
     ///
     /// Panics only on malformed input lengths; a bad proof returns
@@ -379,6 +432,17 @@ impl LightClient {
         let control_root = to32(&control_root, "control_root");
         let claim_digest = to32(&claim_digest, "claim_digest");
         let bn254_control_id = to32(&bn254_control_id, "bn254_control_id");
+        // Reject unknown wrapper builds before touching the proof. The verifying key
+        // is RISC Zero's STARK→SNARK wrapper key, so the wrapper build is the trust
+        // anchor: a receipt is only meaningful if we accept that wrapper.
+        require!(
+            control_root == self.control_root,
+            "unsupported RISC Zero wrapper: control_root not pinned"
+        );
+        require!(
+            bn254_control_id == self.bn254_control_id,
+            "unsupported RISC Zero wrapper: bn254_control_id not pinned"
+        );
         let seal = seal.0;
         require!(seal.len() == 256, "seal must be 256 bytes");
 
