@@ -1,6 +1,12 @@
 # Build artifacts (workspace target dirs)
 /target*/
 
+# devenv / direnv
+.devenv/
+.direnv/
+result
+result-*
+
 # Python
 __pycache__/
 
