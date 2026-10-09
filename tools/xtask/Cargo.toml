@@ -10,4 +10,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 flate2 = "1"
 sha2 = "0.10"
+guest = { path = "../../guest" }
+verify-core = { path = "../../verify-core" }
 ureq = "2"

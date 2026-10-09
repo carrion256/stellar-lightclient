@@ -8,12 +8,14 @@
 //! so the journal the NEAR contract checks was produced by the same
 //! verification path.
 
+use bincode::Options;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use verify_core::{
-    encode_journal, verify_span, Crypto, EpochJournal, Error, SpanProof, Trust,
+    encode_journal, trust_digest, verify_span, Checkpoint, Crypto, EpochJournal,
+    Error, SpanProof, Trust,
 };
 
 /// The guest's [`Crypto`] backend: real SHA-256 and ed25519, no shortcuts.
@@ -39,6 +41,8 @@ impl Crypto for Sha256Dalek {
 /// set (if pinned), and claims against that set.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpanInput {
+    /// Authenticated header at `start_seq`, when claims need predecessor context.
+    pub start_header: Option<Vec<u8>>,
     pub headers: Vec<Vec<u8>>,
     pub tail_envelopes: Vec<Vec<u8>>,
     pub tail_set: Option<Vec<u8>>,
@@ -58,12 +62,19 @@ pub struct EpochInput {
 /// Verifies every span in order, chaining each span's start from the previous
 /// outcome, and returns the journal for the whole epoch. Claim ids accumulate
 /// across all spans; a zero-span epoch is valid and yields a start==end journal.
+///
+/// The journal's `end_seq`/`end_hash` commit the latest authenticated
+/// checkpoint (the starting head if no span pinned anything), never the
+/// unauthenticated tail, and `policy_digest` binds the trust policy the
+/// proofs were signed under. Trust is validated even for a zero-span epoch.
 pub fn run_epoch(input: &EpochInput) -> Result<EpochJournal, Error> {
     run_epoch_with(&Sha256Dalek, input)
 }
 
 /// Same as [`run_epoch`] with an injectable crypto backend (for testing).
 pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<EpochJournal, Error> {
+    let policy_digest = trust_digest(crypto, &input.trust)?;
+    let mut authenticated_head = Checkpoint { seq: input.start_seq, hash: input.start_hash };
     let mut start_seq = input.start_seq;
     let mut start_hash = input.start_hash;
     let mut claim_ids = Vec::new();
@@ -82,6 +93,7 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
             .collect();
 
         let proof = SpanProof {
+            start_header: span.start_header.as_deref(),
             headers: &headers,
             tail_envelopes: &tail_envelopes,
             tail_set: span.tail_set.as_deref(),
@@ -90,6 +102,11 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
         let outcome = verify_span(crypto, &input.trust, start_seq, start_hash, &proof)?;
 
         claim_ids.extend_from_slice(&outcome.claim_ids);
+        // Chaining follows the working tail; the journal commits only the
+        // latest authenticated checkpoint, never an unauthenticated end.
+        if let Some(head) = outcome.authenticated_head {
+            authenticated_head = head;
+        }
         start_seq = outcome.tail_seq;
         start_hash = outcome.tail_hash;
     }
@@ -97,8 +114,9 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
     Ok(EpochJournal {
         start_seq: input.start_seq,
         start_hash: input.start_hash,
-        end_seq: start_seq,
-        end_hash: start_hash,
+        end_seq: authenticated_head.seq,
+        end_hash: authenticated_head.hash,
+        policy_digest,
         claim_ids,
     })
 }
@@ -106,8 +124,12 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
 /// zkVM entry helper: deserialize the [`EpochInput`], run the epoch, return
 /// the journal bytes for commitment.
 pub fn run_epoch_bytes(input_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let input: EpochInput =
-        bincode::deserialize(input_bytes).map_err(|e| format!("invalid epoch input: {e}"))?;
+    let input: EpochInput = bincode::options()
+        .with_fixint_encoding()
+        .with_limit(input_bytes.len() as u64)
+        .reject_trailing_bytes()
+        .deserialize(input_bytes)
+        .map_err(|e| format!("invalid epoch input: {e}"))?;
     let journal = run_epoch(&input).map_err(|e| format!("epoch verification failed: {e}"))?;
     Ok(encode_journal(&journal))
 }

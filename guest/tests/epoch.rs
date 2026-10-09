@@ -1,6 +1,6 @@
-//! Real-fixture epoch tests: two consecutive mainnet closes, each verified as
-//! one span, chained, with a deposit claim each. The negative tests pin the
-//! three failure classes the contract must never accept.
+//! Real-fixture epoch tests: two consecutive mainnet closes, chained with an
+//! anchored transaction-envelope inclusion claim. No transaction execution or
+//! deposit settlement is implied by an inclusion ID.
 
 use std::io::Cursor;
 
@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::Value;
 use stellar_xdr::{LedgerHeader, Limited, Limits, PublicKey, ReadXdr, ScpEnvelope, ScpStatementPledges};
-use verify_core::{Crypto, Trust};
+use verify_core::{trust_digest, validate_trust, Crypto, Error, Trust};
 
 use guest::{run_epoch, EpochInput, Sha256Dalek, SpanInput};
 use verify_core::{decode_journal, encode_journal};
@@ -90,16 +90,29 @@ fn epoch_input(fixture: &Value) -> EpochInput {
         max_protocol_version: 99,
     };
 
+    // Claims need authenticated predecessor context: span 0 has no header for
+    // its start ledger in the fixture, so it carries none; span 1's predecessor
+    // is literally the first close and is supplied as the anchor.
     let spans = closes
         .iter()
-        .map(|close| SpanInput {
+        .enumerate()
+        .map(|(index, close)| SpanInput {
+            start_header: if index == 0 {
+                None
+            } else {
+                Some(b64(&closes[index - 1]["header_xdr_b64"]))
+            },
             headers: vec![b64(&close["header_xdr_b64"])],
             tail_envelopes: b64_list(&close["scp_envelopes_b64"]),
             tail_set: Some(b64(&close["tx_set_xdr_b64"])),
-            claims: vec![(
-                b64(&close["tx_envelope_xdr_b64"]),
-                close["tx_index"].as_u64().unwrap() as u32,
-            )],
+            claims: if index == 0 {
+                vec![]
+            } else {
+                vec![(
+                    b64(&close["tx_envelope_xdr_b64"]),
+                    close["tx_index"].as_u64().unwrap() as u32,
+                )]
+            },
         })
         .collect();
 
@@ -120,24 +133,23 @@ fn real_mainnet_epoch_verifies_and_chains() {
     let journal = run_epoch(&input).expect("real mainnet epoch must verify");
 
     assert_eq!(journal.start_seq, closes[0]["ledger_seq"].as_u64().unwrap() as u32 - 1);
-    assert_eq!(journal.end_seq, closes[1]["ledger_seq"].as_u64().unwrap() as u32);
+    // The journal commits the latest *authenticated* checkpoint: both spans
+    // pinned through their predecessor, i.e. the first close — never the
+    // unauthenticated tail (the second close).
+    assert_eq!(journal.end_seq, closes[0]["ledger_seq"].as_u64().unwrap() as u32);
     assert_eq!(journal.start_hash, b64_32(&closes[0]["tx_set_previous_ledger_hash_b64"]));
-    assert_eq!(journal.end_hash, b64_32(&closes[1]["header_hash_b64"]));
+    assert_eq!(journal.end_hash, b64_32(&closes[0]["header_hash_b64"]));
 
-    let expected_claims: Vec<[u8; 32]> = closes
-        .iter()
-        .map(|c| Sha256Dalek.sha256(&b64(&c["tx_envelope_xdr_b64"])))
-        .collect();
-    assert_eq!(journal.claim_ids, expected_claims, "one claim id per close");
-    assert_eq!(journal.claim_ids.len(), 2);
+    let expected_claims: Vec<[u8; 32]> = vec![Sha256Dalek.sha256(
+        &b64(&closes[1]["tx_envelope_xdr_b64"]),
+    )];
+    assert_eq!(journal.claim_ids, expected_claims, "one claim id per anchored span");
+    assert_eq!(journal.claim_ids.len(), 1);
+    assert_eq!(journal.policy_digest, trust_digest(&Sha256Dalek, &input.trust).unwrap());
 
     let bytes = encode_journal(&journal);
     let decoded = decode_journal(&bytes).expect("journal round-trip");
-    assert_eq!(decoded.start_seq, journal.start_seq);
-    assert_eq!(decoded.start_hash, journal.start_hash);
-    assert_eq!(decoded.end_seq, journal.end_seq);
-    assert_eq!(decoded.end_hash, journal.end_hash);
-    assert_eq!(decoded.claim_ids, journal.claim_ids);
+    assert_eq!(decoded, journal);
 }
 
 #[test]
@@ -158,9 +170,8 @@ fn tampered_signature_fails() {
 fn claim_at_wrong_index_fails() {
     let fixture = fixture();
     let mut input = epoch_input(&fixture);
-
-    // Claim the envelope at a slot it does not occupy.
-    input.spans[0].claims[0].1 += 1;
+    // Claim the anchored envelope at a slot it does not occupy.
+    input.spans[1].claims[0].1 += 1;
 
     assert!(run_epoch(&input).is_err(), "claim at a wrong index must fail");
 }
@@ -176,4 +187,93 @@ fn second_span_broken_chain_link_fails() {
     input.spans[1].headers[0][4] ^= 0xff;
 
     assert!(run_epoch(&input).is_err(), "broken chain link must fail");
+}
+
+#[test]
+fn single_header_claim_without_anchor_fails() {
+    let fixture = fixture();
+    let mut input = epoch_input(&fixture);
+
+    // The fixture carries no header for span 0's start ledger; claiming
+    // against it anyway must fail closed on the missing predecessor.
+    let first = &fixture["closes"][0];
+    input.spans[0].claims = vec![(
+        b64(&first["tx_envelope_xdr_b64"]),
+        first["tx_index"].as_u64().unwrap() as u32,
+    )];
+
+    let err = run_epoch(&input).err().expect("unanchored single-header claim must fail");
+    assert_eq!(err, Error::ClaimsRequirePredecessor);
+}
+
+#[test]
+fn empty_epoch_validates_trust_and_commits_the_start_checkpoint() {
+    let fixture = fixture();
+    let mut input = epoch_input(&fixture);
+    input.spans = vec![];
+
+    let journal = run_epoch(&input).expect("empty epoch with valid trust is valid");
+    assert_eq!(journal.start_seq, input.start_seq);
+    assert_eq!(journal.end_seq, input.start_seq);
+    assert_eq!(journal.end_hash, input.start_hash);
+    assert!(journal.claim_ids.is_empty());
+    assert_eq!(journal.policy_digest, trust_digest(&Sha256Dalek, &input.trust).unwrap());
+
+    // Zero-span epochs validate trust too: an attacker-supplied threshold 0
+    // is rejected before any journal is committed.
+    let mut zero = input.clone();
+    zero.trust.threshold = 0;
+    let err = run_epoch(&zero).err().expect("invalid trust must fail closed");
+    assert_eq!(err, Error::InvalidTrust("threshold outside trusted node count"));
+
+    let mut dup = input.clone();
+    dup.trust.trusted_nodes.push(dup.trust.trusted_nodes[0]);
+    assert_eq!(run_epoch(&dup).err(), Some(Error::InvalidTrust("duplicate trusted node")));
+    assert!(validate_trust(&input.trust).is_ok());
+}
+
+#[test]
+fn attacker_trust_produces_a_different_policy_digest() {
+    let fixture = fixture();
+    let input = epoch_input(&fixture);
+    let ours = trust_digest(&Sha256Dalek, &input.trust).unwrap();
+
+    // Same shape, attacker keys: the policy digest must diverge so the
+    // contract can pin its own configuration against the journal.
+    let attacker = Trust {
+        network_id: input.trust.network_id,
+        trusted_nodes: vec![[9u8; 32]; 1],
+        threshold: 1,
+        max_protocol_version: input.trust.max_protocol_version,
+    };
+    assert!(validate_trust(&attacker).is_ok(), "attacker policy is well-formed");
+    let theirs = trust_digest(&Sha256Dalek, &attacker).unwrap();
+    assert_ne!(ours, theirs);
+
+    // Order of nodes does not change the digest; it binds the *set*.
+    let mut shuffled = input.trust.clone();
+    shuffled.trusted_nodes.reverse();
+    assert_eq!(trust_digest(&Sha256Dalek, &shuffled).unwrap(), ours);
+}
+
+#[test]
+fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
+    let fixture = fixture();
+    let input = epoch_input(&fixture);
+    let bytes = bincode::serialize(&input).unwrap();
+    let journal = decode_journal(&guest::run_epoch_bytes(&bytes).unwrap()).unwrap();
+    assert_eq!(journal.end_hash, b64_32(&fixture["closes"][0]["header_hash_b64"]));
+    assert_eq!(journal.claim_ids, vec![Sha256Dalek.sha256(
+        &b64(&fixture["closes"][1]["tx_envelope_xdr_b64"]),
+    )]);
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(guest::run_epoch_bytes(&trailing).is_err());
+    assert!(guest::run_epoch_bytes(&bytes[..bytes.len() - 1]).is_err());
+
+    // Fixed-int bincode: the trust's node count follows its 32-byte network ID.
+    let mut oversized = bytes;
+    oversized[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(guest::run_epoch_bytes(&oversized).is_err());
 }

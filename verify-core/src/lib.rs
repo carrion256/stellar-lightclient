@@ -20,19 +20,20 @@
 //! ledger).
 //!
 //! The tail transaction set is *optional*:
-//! - present → the span is pinned immediately (`pinned_seq` reports through
-//!   which ledger);
+//! - present → the span is pinned immediately (`authenticated_head` reports
+//!   the latest authenticated checkpoint — the ledger *before* the tail);
 //! - absent → the span is provisional. The head still advances and later spans
 //!   still chain to it, and the chain gets pinned by any later span that does
 //!   bring a set. Claims can never be provisional: proving inclusion needs the
-//!   set, so claims carry it.
+//!   set, and the predecessor context (its header or an authenticated anchor),
+//!   so claims carry both.
 
 use std::io::Cursor;
 
 use stellar_xdr::{
-    EnvelopeType, GeneralizedTransactionSet, Hash, LedgerHeader, Limited, Limits, PublicKey,
-    ReadXdr, ScpEnvelope, ScpStatementPledges, Signature, StellarValue, TransactionEnvelope,
-    TransactionPhase, TransactionSet, TxSetComponent, Value, WriteXdr,
+    EnvelopeType, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerUpgrade, Limited, Limits,
+    PublicKey, ReadXdr, ScpEnvelope, ScpStatementPledges, Signature, StellarValue,
+    TransactionEnvelope, TransactionPhase, TransactionSet, TxSetComponent, Value, WriteXdr,
 };
 
 mod journal;
@@ -58,9 +59,47 @@ pub struct Trust {
     pub max_protocol_version: u32,
 }
 
+/// Validate quorum configuration before processing any witness.
+pub fn validate_trust(trust: &Trust) -> Result<(), Error> {
+    if trust.threshold == 0 || trust.threshold as usize > trust.trusted_nodes.len() {
+        return Err(Error::InvalidTrust("threshold outside trusted node count"));
+    }
+    for (index, node) in trust.trusted_nodes.iter().enumerate() {
+        if trust.trusted_nodes[..index].contains(node) {
+            return Err(Error::InvalidTrust("duplicate trusted node"));
+        }
+    }
+    Ok(())
+}
+
+/// Domain-separated commitment to the complete policy, independent of node order.
+pub fn trust_digest<C: Crypto>(crypto: &C, trust: &Trust) -> Result<[u8; 32], Error> {
+    validate_trust(trust)?;
+    let mut nodes = trust.trusted_nodes.clone();
+    nodes.sort_unstable();
+    let mut bytes = Vec::with_capacity(80 + nodes.len() * 32);
+    bytes.extend_from_slice(b"stellar-lightclient/trust/v1\0");
+    bytes.extend_from_slice(&trust.network_id);
+    bytes.extend_from_slice(&(nodes.len() as u32).to_be_bytes());
+    for node in nodes {
+        bytes.extend_from_slice(&node);
+    }
+    bytes.extend_from_slice(&trust.threshold.to_be_bytes());
+    bytes.extend_from_slice(&trust.max_protocol_version.to_be_bytes());
+    Ok(crypto.sha256(&bytes))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub seq: u32,
+    pub hash: [u8; 32],
+}
+
 /// A span of consecutive ledgers plus the evidence authenticating its tail.
 /// Borrowed so the caller's decoded payload buffers are never copied.
 pub struct SpanProof<'a> {
+    /// Optional authenticated starting header, needed for single-header claims.
+    pub start_header: Option<&'a [u8]>,
     /// XDR `LedgerHeader` for each ledger `start_seq + 1 ..= tail_seq`, ascending.
     pub headers: &'a [&'a [u8]],
     /// XDR `ScpEnvelope`s forming the quorum certificate for the tail ledger.
@@ -80,7 +119,7 @@ pub struct SpanOutcome {
     /// Ledger through which the chain is pinned by signed bytes, if the tail set
     /// was verified. The tail header itself is pinned by the next span that
     /// brings a set.
-    pub pinned_seq: Option<u32>,
+    pub authenticated_head: Option<Checkpoint>,
     /// Distinct trusted signers whose signatures were verified.
     pub quorum_signers: u32,
     /// sha256(tx envelope) per proven claim.
@@ -91,6 +130,11 @@ pub struct SpanOutcome {
 /// contract's original panic string plus positional context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    InvalidTrust(&'static str),
+    InvalidStartHeader,
+    ClaimsRequirePredecessor,
+    InvalidUpgradeXdr,
+    UpgradeNotMonotonic { version: u32, predecessor: u32 },
     EmptySpan,
     InvalidHeaderXdr { index: usize },
     UnexpectedLedgerSeq { index: usize, prev_seq: u32, actual: u32 },
@@ -117,6 +161,14 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::InvalidTrust(reason) => write!(f, "invalid trust: {reason}"),
+            Error::InvalidStartHeader => f.write_str("starting header does not match checkpoint"),
+            Error::ClaimsRequirePredecessor => f.write_str("claims require an authenticated predecessor header"),
+            Error::InvalidUpgradeXdr => f.write_str("invalid signed ledger upgrade"),
+            Error::UpgradeNotMonotonic { version, predecessor } => write!(
+                f,
+                "protocol upgrade must increase monotonically — {version} <= {predecessor}"
+            ),
             Error::EmptySpan => f.write_str("span needs at least the tail header"),
             Error::InvalidHeaderXdr { index } => {
                 write!(f, "invalid ledger header xdr — header {index}")
@@ -188,6 +240,7 @@ pub fn verify_span<C: Crypto>(
     start_hash: [u8; 32],
     proof: &SpanProof,
 ) -> Result<SpanOutcome, Error> {
+    validate_trust(trust)?;
     if proof.headers.is_empty() {
         return Err(Error::EmptySpan);
     }
@@ -197,6 +250,15 @@ pub fn verify_span<C: Crypto>(
     let mut prev_hash = start_hash;
     let mut pinned_by_set = start_hash;
     let mut tail: Option<(LedgerHeader, [u8; 32])> = None;
+    let mut predecessor_version = None;
+    if let Some(raw) = proof.start_header {
+        let header: LedgerHeader = decode(raw).map_err(|_| Error::InvalidStartHeader)?;
+        if header.ledger_seq != start_seq || crypto.sha256(raw) != start_hash {
+            return Err(Error::InvalidStartHeader);
+        }
+        check_protocol(header.ledger_version, trust)?;
+        predecessor_version = Some(header.ledger_version);
+    }
     for (index, raw) in proof.headers.iter().enumerate() {
         let header: LedgerHeader = decode(raw).map_err(|_| Error::InvalidHeaderXdr { index })?;
         // `checked_add` keeps the u32::MAX edge an error instead of a panic;
@@ -216,42 +278,68 @@ pub fn verify_span<C: Crypto>(
             // `prev_hash` is the point the tail set must pin.
             pinned_by_set = prev_hash;
             tail = Some((header, hash));
+        } else {
+            check_protocol(header.ledger_version, trust)?;
+            predecessor_version = Some(header.ledger_version);
         }
         prev_seq = seq;
         prev_hash = hash;
     }
     let (tail_header, tail_hash) = tail.ok_or(Error::EmptySpan)?;
-    if tail_header.ledger_version > trust.max_protocol_version {
-        return Err(Error::ProtocolVersionExceeded {
-            version: tail_header.ledger_version,
-            max: trust.max_protocol_version,
-        });
-    }
 
     // 2) a quorum of trusted nodes externalized exactly the tail header's SCP value.
     let (signed_value, quorum_signers) = check_quorum(crypto, trust, &tail_header, proof.tail_envelopes)?;
+    // The tail's unsigned ledger_version is not authenticated, so it is never
+    // consulted: the signed `LedgerUpgrade::Version` ceilings and the
+    // authenticated predecessor govern what transactions may execute.
+    for upgrade in signed_value.upgrades.iter() {
+        // `UpgradeType` is opaque bytes; the inner upgrade is attacker-shaped
+        // until decoded, so malformed bytes fail closed.
+        let upgrade: LedgerUpgrade =
+            decode(upgrade.0.as_slice()).map_err(|_| Error::InvalidUpgradeXdr)?;
+        if let LedgerUpgrade::Version(version) = upgrade {
+            check_protocol(version, trust)?;
+            // Upgrades::isValidForApply: strictly monotonic — the only version
+            // a ledger upgrade can select is above the predecessor's.
+            if let Some(prev) = predecessor_version {
+                if version <= prev {
+                    return Err(Error::UpgradeNotMonotonic { version, predecessor: prev });
+                }
+            }
+        }
+    }
 
     // 3) the signed value commits to the tail's transaction set ...
-    let mut pinned_seq = None;
+    let mut authenticated_head = None;
     let mut txs: Vec<TransactionEnvelope> = Vec::new();
     if let Some(set) = proof.tail_set {
-        if crypto.sha256(set) != signed_value.tx_set_hash.0 {
-            return Err(Error::TxSetHashMismatch);
-        }
-        // ... and the set pins the previous header, which pins the chain backwards.
-        let set_prev = if proof.claims.is_empty() {
-            tx_set_prev_hash(set)?
+        // ... and the set pins the previous header, which pins the chain
+        // backwards, and its signed `txSetHash` commits to exactly its
+        // contents. stellar-core hashes the two encodings differently
+        // (TxSetFrame.cpp): generalized over the whole XDR, legacy as
+        // SHA256(prev || envelopes) without the vector count.
+        let kind = if proof.claims.is_empty() {
+            tx_set_kind_prev(set, pinned_by_set)?
         } else {
-            let (prev, list) = parse_tx_set(set)?;
+            predecessor_version.ok_or(Error::ClaimsRequirePredecessor)?;
+            let (kind, prev, list) = parse_tx_set(set)?;
+            if prev.0 != pinned_by_set {
+                return Err(Error::TxSetPreviousLedgerHashMismatch);
+            }
             txs = list;
-            prev.0
+            kind
         };
-        if set_prev != pinned_by_set {
-            return Err(Error::TxSetPreviousLedgerHashMismatch);
+        let set_hash = match kind {
+            SetKind::Generalized => crypto.sha256(set),
+            SetKind::Legacy => legacy_tx_set_contents_hash(crypto, set)
+                .ok_or(Error::TxSetTooShort)?,
+        };
+        if set_hash != signed_value.tx_set_hash.0 {
+            return Err(Error::TxSetHashMismatch);
         }
         // The tail header is pinned by the *next* span that brings a set; this
         // span is pinned through the ledger before the tail.
-        pinned_seq = Some(prev_seq.saturating_sub(1));
+        authenticated_head = Some(Checkpoint { seq: prev_seq - 1, hash: pinned_by_set });
     }
 
     // 4) claims need the set: inclusion cannot be proven without it.
@@ -274,10 +362,17 @@ pub fn verify_span<C: Crypto>(
     Ok(SpanOutcome {
         tail_seq: tail_header.ledger_seq,
         tail_hash,
-        pinned_seq,
+        authenticated_head,
         quorum_signers,
         claim_ids,
     })
+}
+
+fn check_protocol(version: u32, trust: &Trust) -> Result<(), Error> {
+    if version > trust.max_protocol_version {
+        return Err(Error::ProtocolVersionExceeded { version, max: trust.max_protocol_version });
+    }
+    Ok(())
 }
 
 /// Verify signatures of trusted nodes externalizing exactly the header's SCP
@@ -345,13 +440,12 @@ fn check_quorum<C: Crypto>(
 // ---------------------------------------------------------------- decoding helpers
 
 fn decode<T: ReadXdr>(bytes: &[u8]) -> Result<T, stellar_xdr::Error> {
-    let mut reader = Limited::new(Cursor::new(bytes), Limits::none());
+    let mut reader = Limited::new(Cursor::new(bytes), Limits { depth: 64, len: bytes.len() });
     T::read_xdr_to_end(&mut reader)
 }
 
 fn try_decode<T: ReadXdr>(bytes: &[u8]) -> Option<T> {
-    let mut reader = Limited::new(Cursor::new(bytes), Limits::none());
-    T::read_xdr_to_end(&mut reader).ok()
+    decode(bytes).ok()
 }
 
 fn encode<T: WriteXdr>(value: &T) -> Result<Vec<u8>, Error> {
@@ -361,67 +455,81 @@ fn encode<T: WriteXdr>(value: &T) -> Result<Vec<u8>, Error> {
     Ok(buf)
 }
 
-/// Read `previousLedgerHash` from a transaction set without decoding the set.
-///
-/// ponytail: the set kind is inferred from the XDR union discriminant (4 bytes) instead
-/// of parsing every transaction envelope — a 341 KiB set of ~385 envelopes reduced to a
-/// 36-byte read. The sha256 check pins these bytes to the signed value and the chain
-/// check pins the hash, so misreading the kind fails closed (it can only reject), with
-/// the theoretical exception of a 2^-32 prefix collision. Upgrade path: [`parse_tx_set`],
-/// which is exact and already used whenever claims are present.
-fn tx_set_prev_hash(bytes: &[u8]) -> Result<[u8; 32], Error> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetKind {
+    Generalized,
+    Legacy,
+}
+
+/// `sha256(previousLedgerHash || raw envelope XDRs)` for a legacy
+/// `TransactionSet`, per stellar-core's
+/// `computeNonGeneralizedTxSetContentsHash` — the 4-byte vector count at
+/// bytes 32..36 is deliberately **not** hashed. `set` must be the canonical
+/// XDR encoding; `None` on any input too short to carry the prefix.
+pub fn legacy_tx_set_contents_hash<C: Crypto>(crypto: &C, set: &[u8]) -> Option<[u8; 32]> {
+    if set.len() < 36 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(set.len() - 4);
+    buf.extend_from_slice(&set[..32]);
+    buf.extend_from_slice(&set[36..]);
+    Some(crypto.sha256(&buf))
+}
+
+/// The signed hash pins the bytes; match both possible layouts against the
+/// expected predecessor rather than guessing from a colliding legacy prefix.
+fn tx_set_kind_prev(bytes: &[u8], expected: [u8; 32]) -> Result<SetKind, Error> {
     if bytes.len() < 36 {
         return Err(Error::TxSetTooShort);
     }
-    let discriminant = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let offset = if discriminant == 1 {
-        4 // GeneralizedTransactionSet: union discriminant precedes TransactionSetV1
+    if bytes[..4] == 1i32.to_be_bytes() && bytes[4..36] == expected {
+        Ok(SetKind::Generalized)
+    } else if bytes[..32] == expected {
+        Ok(SetKind::Legacy)
     } else {
-        0 // TransactionSet starts with the hash
-    };
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes[offset..offset + 32]);
-    Ok(out)
+        Err(Error::TxSetPreviousLedgerHashMismatch)
+    }
 }
 
-/// Split a transaction set into its `previousLedgerHash` and its transactions.
+/// Split a transaction set into its kind, its `previousLedgerHash`, and its
+/// transactions (moved out of the parsed set — no deep copy).
 ///
-/// Both encodings start with that hash: `TransactionSet` directly, and
-/// `GeneralizedTransactionSet` after the union discriminant. Whichever type
-/// re-encodes byte-identically is the one the network hashed.
-fn parse_tx_set(bytes: &[u8]) -> Result<(Hash, Vec<TransactionEnvelope>), Error> {
+/// Whichever encoding re-encodes byte-identically is the one the network
+/// hashed; both encodings start with the previous hash
+/// (`GeneralizedTransactionSet` after the union discriminant).
+fn parse_tx_set(bytes: &[u8]) -> Result<(SetKind, Hash, Vec<TransactionEnvelope>), Error> {
     if let Some(set) = try_decode::<GeneralizedTransactionSet>(bytes) {
         if encode(&set)? == bytes {
-            let GeneralizedTransactionSet::V1(v1) = &set;
+            let GeneralizedTransactionSet::V1(v1) = set;
             let mut txs = Vec::new();
-            for phase in v1.phases.iter() {
+            for phase in Vec::from(v1.phases) {
                 match phase {
                     TransactionPhase::V0(components) => {
-                        for component in components.iter() {
+                        for component in Vec::from(components) {
                             let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
                                 component;
-                            txs.extend(component.txs.iter().cloned());
+                            txs.extend(Vec::from(component.txs));
                         }
                     }
                     TransactionPhase::V1(component) => {
                         // Parallel phase: stages of dependent-tx clusters, flattened in
                         // serialization order so indices match the set as hashed.
-                        for stage in component.execution_stages.iter() {
-                            for cluster in stage.0.iter() {
-                                txs.extend(cluster.0.iter().cloned());
+                        for stage in Vec::from(component.execution_stages) {
+                            for cluster in Vec::from(stage.0) {
+                                txs.extend(Vec::from(cluster.0));
                             }
                         }
                     }
                 }
             }
-            return Ok((v1.previous_ledger_hash.clone(), txs));
+            return Ok((SetKind::Generalized, v1.previous_ledger_hash, txs));
         }
     }
     let set: TransactionSet = decode(bytes).map_err(|_| Error::InvalidTxSetXdr)?;
     if encode(&set)? != bytes {
         return Err(Error::NonCanonicalTxSet);
     }
-    Ok((set.previous_ledger_hash.clone(), set.txs.iter().cloned().collect()))
+    Ok((SetKind::Legacy, set.previous_ledger_hash, Vec::from(set.txs)))
 }
 
 fn value_bytes(value: &Value) -> &[u8] {

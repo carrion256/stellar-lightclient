@@ -4,7 +4,9 @@
 Consumes the proof JSON produced by the fixture fetcher
 (`cargo run -p xtask -- fetch-fixture`) and builds a *span* proof: one header per
 ledger, with a single quorum certificate and transaction set at the tail. The tail's
-certificate authenticates the whole span, so intermediate ledgers cost only 428 B.
+certificate authenticates every ledger BEFORE the tail; the tail header itself is
+only pinned by the next submission from the stored checkpoint, or by its own tx set
+plus a supplied `start_header_xdr_b64` (claims always need that predecessor).
 
 Two encodings:
   --format json   JSON + base64 args for `submit_span` (explorer/wallet friendly)
@@ -19,38 +21,50 @@ Usage:
     tools/relay.py --proof testdata/fixture.json --contract lc.testnet --format borsh --dry-run
     tools/relay.py --proof testdata/fixture.json --contract lc.testnet --signer relayer.testnet --send
 
-`--send` shells out to `near-cli-rs`; without it the exact command (or raw bytes) is
-printed.
+`--send` invokes `near-cli-rs` using a temporary file for either encoding.
+Without it, a replayable shell command recreates the payload via stdin (or points
+at the file given to `--output`). Never pass large calldata in argv.
+
+Single-header spans with claims are rejected unless the proof carries
+`start_header_xdr_b64`: the shared core refuses claims without an authenticated
+predecessor, so don't print or send known-failing proofs.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import shlex
 import struct
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
-# fixture key → contract key for the tail close
-CLOSE_KEYS = {
-    "header_xdr_b64": "header",
-    "scp_envelopes_b64": "tail_envelopes",
-    "tx_set_xdr_b64": "tail_tx_set_xdr",
-}
-
-
-def b64(value: str) -> bytes:
-    import base64
-
-    return base64.b64decode(value)
+def b64(value: str, field: str = "base64") -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"{field}: expected a base64 string")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(f"{field}: invalid base64") from exc
+    if base64.b64encode(decoded).decode() != value:
+        raise ValueError(f"{field}: expected canonical base64")
+    return decoded
 
 
 def build_span(proof: dict, tail_index: int, with_claims: bool) -> dict:
     """One span over all closes, certified at `tail_index`."""
     closes = proof["closes"]
+    if not isinstance(closes, list) or not closes:
+        raise ValueError("closes: expected a nonempty list")
+    if not -len(closes) <= tail_index < len(closes):
+        raise ValueError(f"--tail-index must be between {-len(closes)} and {len(closes) - 1}")
     if tail_index < 0:
         tail_index += len(closes)
     tail = closes[tail_index]
     span = {
+        "start_header": proof.get("start_header_xdr_b64"),
         "headers": [c["header_xdr_b64"] for c in closes[: tail_index + 1]],
         "tail_envelopes": tail["scp_envelopes_b64"],
         "tail_tx_set_xdr": tail["tx_set_xdr_b64"],
@@ -63,6 +77,25 @@ def build_span(proof: dict, tail_index: int, with_claims: bool) -> dict:
                 "tx_index": tail["tx_index"],
             }
         )
+    for index, value in enumerate(span["headers"]):
+        b64(value, f"headers[{index}]")
+    if not isinstance(span["tail_envelopes"], list):
+        raise ValueError("tail_envelopes: expected a list")
+    for index, value in enumerate(span["tail_envelopes"]):
+        b64(value, f"tail_envelopes[{index}]")
+    for field in ("start_header", "tail_tx_set_xdr"):
+        if span[field] is not None:
+            b64(span[field], field)
+    if span["tx_claims"] and len(span["headers"]) == 1 and span["start_header"] is None:
+        raise ValueError(
+            "claims require an authenticated predecessor header: this proof has a "
+            "single header and carries no start_header_xdr_b64 — supply it, or "
+            "use --no-claims (the shared core rejects this proof otherwise)"
+        )
+    for claim in span["tx_claims"]:
+        b64(claim["tx_envelope_xdr"], "tx_envelope_xdr")
+        if type(claim["tx_index"]) is not int or not 0 <= claim["tx_index"] <= 0xFFFFFFFF:
+            raise ValueError("tx_index: expected a u32 integer")
     return span
 
 
@@ -75,11 +108,14 @@ def borsh_vec_bytes(items: list) -> bytes:
 
 
 def encode_borsh(span: dict) -> bytes:
-    """Borsh for SpanProofRaw: Vec<Vec<u8>>, Vec<Vec<u8>>, Option<Vec<u8>>, Vec<claim>."""
-    out = borsh_vec_bytes([b64(h) for h in span["headers"]])
+    """SpanProofRaw: start-header Option, headers, envelopes, set Option, claims."""
+    def option(value):
+        return b"\x00" if value is None else b"\x01" + borsh_bytes(b64(value))
+
+    out = option(span["start_header"])
+    out += borsh_vec_bytes([b64(h) for h in span["headers"]])
     out += borsh_vec_bytes([b64(e) for e in span["tail_envelopes"]])
-    tail = b64(span["tail_tx_set_xdr"]) if span["tail_tx_set_xdr"] else None
-    out += b"\x00" if tail is None else b"\x01" + borsh_bytes(tail)
+    out += option(span["tail_tx_set_xdr"])
     out += struct.pack("<I", len(span["tx_claims"]))
     for claim in span["tx_claims"]:
         out += borsh_bytes(b64(claim["tx_envelope_xdr"]))
@@ -109,13 +145,19 @@ def main() -> int:
     ap.add_argument("--no-claims", action="store_true", help="omit the tail's tx claim")
     ap.add_argument("--gas", default="300.0 Tgas", help="prepaid gas (default: 300.0 Tgas)")
     ap.add_argument("--network", default="testnet", choices=("testnet", "mainnet"), help="NEAR network")
-    ap.add_argument("--send", action="store_true", help="execute via near-cli-rs instead of printing")
-    ap.add_argument("--dry-run", action="store_true", help="print the call payload and exit")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--send", action="store_true", help="execute via near-cli-rs using file-args")
+    mode.add_argument("--dry-run", action="store_true", help="print the call payload and exit")
+    ap.add_argument("--output", help="also save raw JSON/Borsh call bytes at this path")
     args = ap.parse_args()
-
-    with open(args.proof) as fh:
-        proof = json.load(fh)
-    span = build_span(proof, args.tail_index, not args.no_claims)
+    if args.send and not args.signer:
+        ap.error("--send requires --signer")
+    try:
+        with open(args.proof) as fh:
+            proof = json.load(fh)
+        span = build_span(proof, args.tail_index, not args.no_claims)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        ap.error(f"invalid proof: {exc}")
 
     if args.format == "borsh":
         payload = encode_borsh(span)
@@ -124,10 +166,14 @@ def main() -> int:
         payload = json.dumps({"span": span}, separators=(",", ":")).encode()
         method = "submit_span"
 
+    if args.output:
+        try:
+            Path(args.output).write_bytes(payload)
+        except OSError as exc:
+            ap.error(f"cannot write --output: {exc}")
+
     if args.dry_run:
         if args.format == "borsh":
-            import base64
-
             print(f"hex:    {payload.hex()}")
             print(f"base64: {base64.b64encode(payload).decode()}")
             print(f"({len(payload)} bytes of borsh call args for submit_span_raw)")
@@ -135,30 +181,42 @@ def main() -> int:
             sys.stdout.write(payload.decode())
         return 0
 
-    if args.format == "borsh":
-        # near-cli-rs only carries JSON args; raw Borsh bytes go to the RPC as args_base64.
-        print("borsh args are raw bytes: use --dry-run and submit the base64 via RPC args_base64",
-              file=sys.stderr)
-        return 2
-
-    cmd = [
-        "near", "contract", "call-function", "as-transaction",
-        args.contract, method, "json-args", payload.decode(),
-        "prepaid-gas", args.gas, "attached-deposit", "0 NEAR",
-    ]
-    if args.signer:
-        cmd += ["sign-as", args.signer, "network-config", args.network, "sign-with-keychain", "send"]
+    def command(path):
+        cmd = [
+            "near", "contract", "call-function", "as-transaction",
+            args.contract, method, "file-args", path,
+            "prepaid-gas", args.gas, "attached-deposit", "0 NEAR",
+        ]
+        if args.signer:
+            cmd += ["sign-as", args.signer, "network-config", args.network, "sign-with-keychain", "send"]
+        return cmd
 
     if not args.send:
-        if args.format == "borsh":
-            print("borsh args need to be passed as raw bytes; use --dry-run to capture them")
-        print(shlex.join(cmd))
+        if args.output:
+            # The file already holds the exact call bytes; replay needs no temp.
+            print(shlex.join(command(args.output)))
+            return 0
+        # Here-document bytes go through stdin, never a large executable argument.
+        cmd = command("__PAYLOAD_PATH__")
+        shell = shlex.join(cmd).replace("__PAYLOAD_PATH__", '"$payload"')
+        print("(payload=$(mktemp) || exit 1; trap 'rm -f \"$payload\"' EXIT;")
+        print("base64 --decode > \"$payload\" <<'STELLAR_CALL_BYTES'")
+        print(base64.b64encode(payload).decode())
+        print("STELLAR_CALL_BYTES")
+        print(shell + ")")
         return 0
 
-    if not args.signer:
-        print("--send requires --signer", file=sys.stderr)
+    try:
+        with tempfile.TemporaryDirectory(prefix="stellar-relay-") as directory:
+            path = Path(directory) / "args"
+            path.write_bytes(payload)
+            return subprocess.call(command(str(path)))
+    except FileNotFoundError:
+        print("near-cli-rs executable `near` not found; install it and add it to PATH", file=sys.stderr)
         return 2
-    return subprocess.call(cmd)
+    except OSError as exc:
+        print(f"cannot submit call: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

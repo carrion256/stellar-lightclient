@@ -54,11 +54,12 @@ pub struct Proof {
 /// Returns `false` (never panics) for:
 /// * an empty verifying key (`vk.ic` empty),
 /// * a public-input count that doesn't satisfy `public_inputs.len() + 1 == vk.ic.len()`,
-/// * identity points for `A`, `B`, or `C` (a degenerate proof).
+/// * identity points for `A`, `B`, or `C` (a degenerate proof),
+/// * off-curve or wrong-subgroup points among the proof or verifying key (the
+///   NEAR host *aborts* on those; `verify` stays total and returns `false`).
 ///
-/// The only way this function can trap is if the host itself aborts on a
-/// malformed curve encoding — impossible for points produced by our
-/// encoders.
+/// `verify` itself never traps on malformed input: every curve point is checked
+/// on-curve and in the prime-order subgroup before the host is touched.
 pub fn verify(vk: &VerifyingKey, proof: &Proof, public_inputs: &[Fr]) -> bool {
     // Shape / degeneracy guards first — every branch below reaches the host.
     if vk.ic.is_empty() || public_inputs.len() + 1 != vk.ic.len() {
@@ -92,6 +93,23 @@ pub fn verify(vk: &VerifyingKey, proof: &Proof, public_inputs: &[Fr]) -> bool {
         || !on_curve_g2(&vk.gamma_g2)
         || !on_curve_g2(&vk.delta_g2)
         || vk.ic.iter().any(|p| !on_curve_g1(p))
+    {
+        return false;
+    }
+
+    // Points must also lie in the prime-order subgroup: the NEAR host aborts
+    // on G1/G2 encodings that are on-curve but outside it, so a raw-parsed
+    // unchecked point must never reach `pairing_check`.
+    let subgroup_g1 = |p: &G1| p.is_in_correct_subgroup_assuming_on_curve();
+    let subgroup_g2 = |p: &G2| p.is_in_correct_subgroup_assuming_on_curve();
+    if !subgroup_g1(&proof.a)
+        || !subgroup_g2(&proof.b)
+        || !subgroup_g1(&proof.c)
+        || !subgroup_g1(&vk.alpha_g1)
+        || !subgroup_g2(&vk.beta_g2)
+        || !subgroup_g2(&vk.gamma_g2)
+        || !subgroup_g2(&vk.delta_g2)
+        || vk.ic.iter().any(|p| !subgroup_g1(p))
     {
         return false;
     }

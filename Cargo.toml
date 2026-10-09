@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["contract", "tools/xtask", "tools/groth16-fixture", "verifier", "verify-core", "guest"]
-
+members = ["contract", "tools/xtask", "tools/groth16-fixture", "verifier", "verify-core"]
+# `guest/` is its own workspace (see guest/Cargo.toml): cargo risczero builds it
+# standalone with --manifest-path, and a nested root must be excluded here.
+exclude = ["guest"]
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"

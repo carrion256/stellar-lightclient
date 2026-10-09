@@ -5,16 +5,16 @@
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey, Signature as DalekSignature};
 use stellar_xdr::{
-    BumpSequenceOp, EnvelopeType, GeneralizedTransactionSet, Hash, LedgerHeader, Limited, Limits,
-    MuxedAccount, NodeId, Operation, OperationBody, PublicKey, ReadXdr, ScpBallot, ScpEnvelope,
-    ScpStatement, ScpStatementExternalize, ScpStatementPledges, SequenceNumber, Signature,
-    StellarValue, TransactionEnvelope, TransactionPhase, TransactionSet, TransactionSetV1,
-    TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, Uint256, Value,
-    VecM, WriteXdr,
+    BumpSequenceOp, EnvelopeType, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerUpgrade,
+    Limited, Limits, MuxedAccount, NodeId, Operation, OperationBody, PublicKey, ReadXdr,
+    ScpBallot, ScpEnvelope, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
+    SequenceNumber, Signature, StellarValue, TransactionEnvelope, TransactionPhase, TransactionSet,
+    TransactionSetV1, TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+    Uint256, UpgradeType, Value, VecM, WriteXdr,
 };
 use verify_core::{
-    decode_journal, encode_journal, verify_span, Crypto, EpochJournal, Error, SpanOutcome,
-    SpanProof, Trust,
+    decode_journal, encode_journal, legacy_tx_set_contents_hash, validate_trust, verify_span,
+    Checkpoint, Crypto, EpochJournal, Error, SpanOutcome, SpanProof, Trust,
 };
 
 // ------------------------------------------------------------------ crypto
@@ -184,7 +184,12 @@ fn chain(start_seq: u32, start_hash: [u8; 32], tail_seq: u32, kind: SetKind) -> 
     let tail_set = tx_set_bytes(prev, kind, &tx0, &tx1);
     // 3) the tail header externalizes the value committing to that set.
     let tail_value = StellarValue {
-        tx_set_hash: Hash(TestCrypto.sha256(&tail_set)),
+        tx_set_hash: Hash(match kind {
+            // stellar-core: generalized hashes the whole XDR; legacy hashes
+            // prev || envelopes without the vector count.
+            SetKind::Generalized => TestCrypto.sha256(&tail_set),
+            SetKind::Legacy => legacy_tx_set_contents_hash(&TestCrypto, &tail_set).unwrap(),
+        }),
         close_time: stellar_xdr::TimePoint(1),
         upgrades: VecM::default(),
         ext: stellar_xdr::StellarValueExt::Basic,
@@ -216,7 +221,7 @@ fn run<'a>(
 ) -> Result<SpanOutcome, Error> {
     let trust =
         Trust { network_id: NETWORK_ID, trusted_nodes: c.trusted.clone(), threshold, max_protocol_version: MAX_PROTOCOL };
-    let proof = SpanProof { headers, tail_envelopes: envelopes, tail_set, claims };
+    let proof = SpanProof { start_header: None, headers, tail_envelopes: envelopes, tail_set, claims };
     verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof)
 }
 
@@ -232,7 +237,7 @@ fn wellformed_span_verifies_and_chains_acceptance() {
     let c = chain(10, [5u8; 32], 12, SetKind::Generalized);
     let outcome = run(&c, &refs(&c.headers), &refs(&c.envelopes), Some(&c.tail_set), &[], 3).unwrap();
     assert_eq!(outcome.tail_seq, 12);
-    assert_eq!(outcome.pinned_seq, Some(11));
+    assert_eq!(outcome.authenticated_head, Some(Checkpoint { seq: 11, hash: TestCrypto.sha256(&c.headers[0]) }));
     assert_eq!(outcome.quorum_signers, 3);
     assert!(outcome.claim_ids.is_empty());
     assert_eq!(outcome.tail_hash, TestCrypto.sha256(c.headers.last().unwrap()));
@@ -250,6 +255,7 @@ fn wrong_start_hash_breaks_the_chain() {
         max_protocol_version: MAX_PROTOCOL,
     };
     let proof = SpanProof {
+        start_header: None,
         headers: &refs(&c.headers),
         tail_envelopes: &refs(&c.envelopes),
         tail_set: Some(&c.tail_set),
@@ -274,6 +280,7 @@ fn tampered_intermediate_header_is_rejected() {
         max_protocol_version: MAX_PROTOCOL,
     };
     let proof = SpanProof {
+        start_header: None,
         headers: &refs(&headers),
         tail_envelopes: &refs(&c.envelopes),
         tail_set: Some(&c.tail_set),
@@ -294,11 +301,12 @@ fn unexpected_ledger_sequence_is_rejected() {
 
 #[test]
 fn quorum_threshold_met_and_not_met() {
-    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let mut c = chain(11, [5u8; 32], 12, SetKind::Generalized);
     // Met: exactly 3 of 3 externalizers.
     let outcome = run(&c, &refs(&c.headers), &refs(&c.envelopes), Some(&c.tail_set), &[], 3).unwrap();
     assert_eq!(outcome.quorum_signers, 3);
     // Not met: threshold 4 cannot be reached with 3 envelopes.
+    c.trusted.push(node_id(&key(4)));
     let err = run(&c, &refs(&c.headers), &refs(&c.envelopes), Some(&c.tail_set), &[], 4).unwrap_err();
     assert_eq!(err, Error::QuorumNotReached { signers: 3, threshold: 4 });
 }
@@ -345,6 +353,7 @@ fn wrong_network_id_hard_fails() {
         max_protocol_version: MAX_PROTOCOL,
     };
     let proof = SpanProof {
+        start_header: None,
         headers: &refs(&c.headers),
         tail_envelopes: &refs(&c.envelopes),
         tail_set: Some(&c.tail_set),
@@ -378,7 +387,7 @@ fn externalized_value_mismatch_is_rejected() {
 
 #[test]
 fn claims_proven_index_checks() {
-    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let c = chain(10, [5u8; 32], 12, SetKind::Generalized);
     // In range and matching: proven, id = sha256(claim bytes).
     let outcome = run(
         &c,
@@ -426,22 +435,22 @@ fn claim_without_tx_set_is_rejected() {
 fn provisional_span_without_set_is_unpinned() {
     let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
     let outcome = run(&c, &refs(&c.headers), &refs(&c.envelopes), None, &[], 3).unwrap();
-    assert_eq!(outcome.pinned_seq, None);
+    assert_eq!(outcome.authenticated_head, None);
 }
 
 #[test]
 fn prefix_fast_path_matches_full_parse() {
     for kind in [SetKind::Generalized, SetKind::Legacy] {
-        let c = chain(11, [5u8; 32], 12, kind);
+        let c = chain(10, [5u8; 32], 12, kind);
         let hdrs = refs(&c.headers);
         let envs = refs(&c.envelopes);
         // Fast path (no claims): previousLedgerHash read from the 36-byte prefix.
         let fast = run(&c, &hdrs, &envs, Some(&c.tail_set), &[], 3).unwrap();
-        assert_eq!(fast.pinned_seq, Some(11));
+        assert_eq!(fast.authenticated_head, Some(Checkpoint { seq: 11, hash: TestCrypto.sha256(&c.headers[0]) }));
         // Full parse (claims present): must agree on the pin and prove txs.
         let claims = &[(&c.tx0[..], 0u32), (&c.tx1[..], 1u32)];
         let full = run(&c, &hdrs, &envs, Some(&c.tail_set), claims, 3).unwrap();
-        assert_eq!(full.pinned_seq, fast.pinned_seq);
+        assert_eq!(full.authenticated_head, fast.authenticated_head);
         assert_eq!(full.tail_hash, fast.tail_hash);
         assert_eq!(full.quorum_signers, fast.quorum_signers);
         assert_eq!(
@@ -452,16 +461,102 @@ fn prefix_fast_path_matches_full_parse() {
 }
 
 #[test]
-fn protocol_version_beyond_max_is_rejected() {
-    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+fn authenticated_intermediate_version_beyond_max_is_rejected() {
+    let c = chain(10, [5u8; 32], 12, SetKind::Generalized);
     let mut headers = c.headers.clone();
-    // `chain(start_seq, start_hash, tail_seq, …)` builds a single-header span (the
-    // tail), whose predecessor is the chain's start hash — so the version bump
-    // replaces element 0, not element 1.
-    headers[0] = header_bytes(c.tail_seq, [5u8; 32], &c.tail_value, MAX_PROTOCOL + 1);
+    headers[0] = header_bytes(11, [5u8; 32], &StellarValue::default(), MAX_PROTOCOL + 1);
     let err =
         run(&c, &refs(&headers), &refs(&c.envelopes), Some(&c.tail_set), &[], 3).unwrap_err();
     assert_eq!(err, Error::ProtocolVersionExceeded { version: MAX_PROTOCOL + 1, max: MAX_PROTOCOL });
+}
+
+#[test]
+fn tampered_tail_version_commits_only_the_authenticated_head() {
+    // The tail's `ledgerVersion` is unsigned: tampering it changes neither
+    // acceptance nor the committed checkpoint — only the pinned predecessor
+    // is authenticated and journalized.
+    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let mut headers = c.headers.clone();
+    headers[0] = header_bytes(c.tail_seq, [5u8; 32], &c.tail_value, MAX_PROTOCOL + 7);
+    let outcome =
+        run(&c, &refs(&headers), &refs(&c.envelopes), Some(&c.tail_set), &[], 3).unwrap();
+    assert_eq!(outcome.authenticated_head, Some(Checkpoint { seq: 11, hash: [5u8; 32] }));
+}
+
+#[test]
+fn signed_upgrade_beyond_max_is_rejected() {
+    // A genuine quorum value carrying an upgrade past the configured ceiling
+    // fails even when every header field reads within limits.
+    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let value = StellarValue {
+        upgrades: VecM::try_from(vec![UpgradeType(
+            encode_xdr(&LedgerUpgrade::Version(MAX_PROTOCOL + 1))
+                .try_into()
+                .unwrap(), // UpgradeType is opaque bytes
+        )])
+        .unwrap(),
+        ..c.tail_value.clone()
+    };
+    let header = header_bytes(c.tail_seq, [5u8; 32], &value, MAX_PROTOCOL);
+    let env = envelope(&key(0), c.tail_seq, &value);
+    let err = run(&c, &[header.as_slice()], &[env.as_slice()], Some(&c.tail_set), &[], 1)
+        .unwrap_err();
+    assert_eq!(err, Error::ProtocolVersionExceeded { version: MAX_PROTOCOL + 1, max: MAX_PROTOCOL });
+}
+
+#[test]
+fn protocol_upgrade_must_increase_monotonically() {
+    // `Upgrades::isValidForApply`: a signed upgrade at or below the
+    // predecessor's version (no-op / downgrade) rejects even within ceiling.
+    let c = chain(10, [5u8; 32], 12, SetKind::Generalized);
+    let value = StellarValue {
+        upgrades: VecM::try_from(vec![UpgradeType(
+            encode_xdr(&LedgerUpgrade::Version(MAX_PROTOCOL)).try_into().unwrap(),
+        )])
+        .unwrap(),
+        ..c.tail_value.clone()
+    };
+    let header = header_bytes(c.tail_seq, TestCrypto.sha256(c.headers.get(0).unwrap()), &value, MAX_PROTOCOL);
+    let env = envelope(&key(0), c.tail_seq, &value);
+    let headers = c.headers.clone();
+    let err = run(&c, &[headers[0].as_slice(), header.as_slice()], &[env.as_slice()], Some(&c.tail_set), &[], 1)
+        .unwrap_err();
+    assert_eq!(err, Error::UpgradeNotMonotonic { version: MAX_PROTOCOL, predecessor: MAX_PROTOCOL });
+}
+
+#[test]
+fn protocol_20_upgrade_on_pre_v20_predecessor_is_accepted() {
+    // The protocol-20 boundary: ledger 12 closes on top of a v19 predecessor
+    // and its own signed upgrade carries v20 — valid per isValidForApply
+    // (strictly above the predecessor's version, within the client ceiling).
+    // The predecessor's v19 still governs this ledger's transactions.
+    let predecessor = header_bytes(11, [9u8; 32], &StellarValue::default(), 19);
+    let start_hash = TestCrypto.sha256(&predecessor);
+    let c = chain(11, start_hash, 12, SetKind::Generalized);
+    let value = StellarValue {
+        upgrades: VecM::try_from(vec![UpgradeType(
+            encode_xdr(&LedgerUpgrade::Version(20)).try_into().unwrap(),
+        )])
+        .unwrap(),
+        ..c.tail_value.clone()
+    };
+    let header = header_bytes(12, start_hash, &value, 20);
+    let env = envelope(&key(0), 12, &value);
+    let trust = Trust {
+        network_id: NETWORK_ID,
+        trusted_nodes: c.trusted.clone(),
+        threshold: 1,
+        max_protocol_version: 20,
+    };
+    let proof = SpanProof {
+        start_header: Some(&predecessor),
+        headers: &[header.as_slice()],
+        tail_envelopes: &[env.as_slice()],
+        tail_set: Some(&c.tail_set),
+        claims: &[],
+    };
+    let outcome = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap();
+    assert_eq!(outcome.authenticated_head, Some(Checkpoint { seq: 11, hash: start_hash }));
 }
 
 #[test]
@@ -471,10 +566,12 @@ fn journal_roundtrip_and_garbage() {
         start_hash: [1u8; 32],
         end_seq: 9,
         end_hash: [2u8; 32],
+        policy_digest: [5u8; 32],
         claim_ids: vec![[3u8; 32], [4u8; 32]],
     };
     let bytes = encode_journal(&j);
-    assert_eq!(bytes.len(), 76 + 64);
+    assert_eq!(bytes.len(), 112 + 64);
+    assert_eq!(&bytes[..4], &1u32.to_le_bytes(), "explicit v1 prefix");
     assert_eq!(decode_journal(&bytes).unwrap(), j);
 
     let empty = EpochJournal {
@@ -482,10 +579,29 @@ fn journal_roundtrip_and_garbage() {
         start_hash: [0u8; 32],
         end_seq: 0,
         end_hash: [0u8; 32],
+        policy_digest: [5u8; 32],
         claim_ids: vec![],
     };
     assert_eq!(bytes.len() - 64, encode_journal(&empty).len());
     assert_eq!(decode_journal(&encode_journal(&empty)).unwrap(), empty);
+
+    // v0 (version-less 76-byte header + 2 claim ids) is rejected by version
+    // prefix, not mis-parsed as v1.
+    let mut v0 = Vec::new();
+    v0.extend_from_slice(&5u32.to_le_bytes());
+    v0.extend_from_slice(&[1u8; 32]);
+    v0.extend_from_slice(&9u32.to_le_bytes());
+    v0.extend_from_slice(&[2u8; 32]);
+    v0.extend_from_slice(&2u32.to_le_bytes());
+    v0.extend_from_slice(&[3u8; 32]);
+    v0.extend_from_slice(&[4u8; 32]);
+    assert_eq!(v0.len(), 140, "v0 is 76-byte header + claims");
+    assert_eq!(
+        decode_journal(&v0),
+        Err(Error::MalformedJournal("unsupported journal version"))
+    );
+    // A short v0 blob is rejected too — never treated as truncated v1.
+    assert!(decode_journal(&v0[..76]).is_err());
 
     // Trailing garbage rejected.
     let mut bad = encode_journal(&empty);
@@ -501,9 +617,189 @@ fn journal_roundtrip_and_garbage() {
 
     // Claim count / length mismatch rejected.
     let mut bad = encode_journal(&j);
-    bad.truncate(108);
+    bad.truncate(112);
     assert!(decode_journal(&bad).is_err());
 
-    // Shorter than the 76-byte header rejected.
+    // Shorter than the 112-byte header rejected.
     assert!(decode_journal(&[0u8; 40]).is_err());
+}
+
+#[test]
+fn attacker_zero_threshold_is_rejected_before_any_signature_check() {
+    // threshold 0 with only the attacker's key: configuration is invalid, so
+    // no fabricated span can ever verify — regardless of envelope contents.
+    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let trust = Trust {
+        network_id: NETWORK_ID,
+        trusted_nodes: vec![node_id(&key(UNTRUSTED))],
+        threshold: 0,
+        max_protocol_version: MAX_PROTOCOL,
+    };
+    let proof = SpanProof {
+        start_header: None,
+        headers: &refs(&c.headers),
+        tail_envelopes: &refs(&c.envelopes),
+        tail_set: Some(&c.tail_set),
+        claims: &[],
+    };
+    let err = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap_err();
+    assert_eq!(err, Error::InvalidTrust("threshold outside trusted node count"));
+}
+
+#[test]
+fn invalid_trust_configurations_are_rejected() {
+    let dup = Trust {
+        network_id: NETWORK_ID,
+        trusted_nodes: vec![[1u8; 32], [1u8; 32]],
+        threshold: 1,
+        max_protocol_version: MAX_PROTOCOL,
+    };
+    assert_eq!(validate_trust(&dup), Err(Error::InvalidTrust("duplicate trusted node")));
+
+    let over = Trust {
+        network_id: NETWORK_ID,
+        trusted_nodes: vec![[1u8; 32]],
+        threshold: 2,
+        max_protocol_version: MAX_PROTOCOL,
+    };
+    assert_eq!(
+        validate_trust(&over),
+        Err(Error::InvalidTrust("threshold outside trusted node count"))
+    );
+
+}
+
+#[test]
+fn hostile_scp_value_length_fails_closed_without_allocating() {
+    // ScpValue is an unbounded BytesM: with `Limits::none` a 68-byte envelope
+    // declaring a 4 GiB value would abort the process before verification.
+    // Bounded decoding returns InvalidEnvelopeXdr instead.
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&0i32.to_be_bytes()); // PublicKeyTypeEd25519
+    raw.extend_from_slice(&[0u8; 32]); // node id
+    raw.extend_from_slice(&12u64.to_be_bytes()); // slot index
+    raw.extend_from_slice(&3i32.to_be_bytes()); // EXTERNALIZE
+    raw.extend_from_slice(&1u32.to_be_bytes()); // ballot counter
+    raw.extend_from_slice(&0xffff_fffcu32.to_be_bytes()); // declared value length
+    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let err =
+        run(&c, &refs(&c.headers), &[raw.as_slice()], Some(&c.tail_set), &[], 1).unwrap_err();
+    assert_eq!(err, Error::InvalidEnvelopeXdr { index: 0 });
+}
+
+#[test]
+fn single_header_claim_requires_authenticated_predecessor() {
+    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let err = run(
+        &c,
+        &refs(&c.headers),
+        &refs(&c.envelopes),
+        Some(&c.tail_set),
+        &[(&c.tx0, 0)],
+        3,
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::ClaimsRequirePredecessor);
+}
+
+#[test]
+fn anchored_single_header_claim_verifies_and_tampered_anchor_fails() {
+    // Supplying the genuine predecessor header anchors the claim: the span
+    // authenticates the start checkpoint and proves tx inclusion through it.
+    let predecessor = header_bytes(11, [9u8; 32], &StellarValue::default(), MAX_PROTOCOL);
+    let start_hash = TestCrypto.sha256(&predecessor);
+    let c = chain(11, start_hash, 12, SetKind::Generalized);
+    let trust = Trust {
+        network_id: NETWORK_ID,
+        trusted_nodes: c.trusted.clone(),
+        threshold: 3,
+        max_protocol_version: MAX_PROTOCOL,
+    };
+    let headers = refs(&c.headers);
+    let envs = refs(&c.envelopes);
+    let proof = SpanProof {
+        start_header: Some(&predecessor),
+        headers: &headers,
+        tail_envelopes: &envs,
+        tail_set: Some(&c.tail_set),
+        claims: &[(&c.tx0[..], 0u32)],
+    };
+    let outcome = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap();
+    assert_eq!(outcome.claim_ids, vec![TestCrypto.sha256(&c.tx0)]);
+    assert_eq!(outcome.authenticated_head, Some(Checkpoint { seq: 11, hash: start_hash }));
+
+    // A header whose hash is not the checkpoint cannot anchor anything.
+    let mut tampered = predecessor.clone();
+    tampered[4] ^= 0x01;
+    let proof = SpanProof {
+        start_header: Some(&tampered),
+        headers: &headers,
+        tail_envelopes: &envs,
+        tail_set: Some(&c.tail_set),
+        claims: &[(&c.tx0[..], 0u32)],
+    };
+    let err = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap_err();
+    assert_eq!(err, Error::InvalidStartHeader);
+}
+
+#[test]
+fn legacy_tx_set_hash_is_prev_concat_envelopes() {
+    // Independent hand-vector against stellar-core's
+    // computeNonGeneralizedTxSetContentsHash: prev || raw envelopes, never the
+    // serialized TransactionSet (that would include the vector count).
+    let (tx0b, tx1b) = txs();
+    let txs: Vec<TransactionEnvelope> =
+        vec![decode_xdr(&tx0b), decode_xdr(&tx1b)];
+    let prev = [7u8; 32];
+    let set = encode_xdr(&TransactionSet {
+        previous_ledger_hash: Hash(prev),
+        txs: VecM::try_from(txs).unwrap(),
+    });
+    let mut expected = prev.to_vec();
+    expected.extend_from_slice(&tx0b);
+    expected.extend_from_slice(&tx1b);
+    assert_eq!(
+        legacy_tx_set_contents_hash(&TestCrypto, &set).unwrap(),
+        TestCrypto.sha256(&expected)
+    );
+    assert_ne!(legacy_tx_set_contents_hash(&TestCrypto, &set).unwrap(), TestCrypto.sha256(&set));
+    assert_eq!(legacy_tx_set_contents_hash(&TestCrypto, &[0u8; 35]), None);
+}
+
+#[test]
+fn legacy_set_whole_xdr_hash_is_rejected() {
+    // The old wrong algorithm (hash of the entire legacy XDR) must fail the
+    // signed hash comparison instead of verifying.
+    let c = chain(11, [5u8; 32], 12, SetKind::Legacy);
+    let value = StellarValue {
+        tx_set_hash: Hash(TestCrypto.sha256(&c.tail_set)),
+        ..c.tail_value.clone()
+    };
+    let header = header_bytes(c.tail_seq, [5u8; 32], &value, MAX_PROTOCOL);
+    let env = envelope(&key(0), c.tail_seq, &value);
+    let err = run(&c, &[header.as_slice()], &[env.as_slice()], Some(&c.tail_set), &[], 1)
+        .unwrap_err();
+    assert_eq!(err, Error::TxSetHashMismatch);
+}
+
+#[test]
+fn legacy_set_with_claims_verifies_through_the_same_hash() {
+    // The claims path must reuse the same parsed set and hash rule — no
+    // separate legacy hashing anywhere (chain() built the value correctly).
+    for kind in [SetKind::Legacy, SetKind::Generalized] {
+        let c = chain(10, [5u8; 32], 12, kind);
+        let outcome = run(
+            &c,
+            &refs(&c.headers),
+            &refs(&c.envelopes),
+            Some(&c.tail_set),
+            &[(&c.tx0[..], 0u32), (&c.tx1[..], 1u32)],
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.claim_ids,
+            vec![TestCrypto.sha256(&c.tx0), TestCrypto.sha256(&c.tx1)]
+        );
+    }
 }

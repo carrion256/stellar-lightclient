@@ -9,8 +9,8 @@ use serde_json::Value;
 use stellar_xdr::{LedgerHeader, Limited, Limits, PublicKey, ReadXdr, ScpEnvelope, ScpStatementPledges};
 use std::io::Cursor;
 use verify_core::{
-    decode_journal, encode_journal, verify_span, Crypto, EpochJournal, Error, SpanOutcome,
-    SpanProof, Trust,
+    decode_journal, encode_journal, verify_span, Checkpoint, Crypto, EpochJournal, Error,
+    SpanOutcome, SpanProof, Trust,
 };
 
 const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/fixture.json");
@@ -156,6 +156,7 @@ fn real_mainnet_sparse_span_verifies() {
         s.start_seq,
         s.start_hash,
         &SpanProof {
+            start_header: None,
             headers: &headers,
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
@@ -165,7 +166,10 @@ fn real_mainnet_sparse_span_verifies() {
     .unwrap();
     assert_eq!(outcome.tail_seq, s.tail_seq);
     assert_eq!(outcome.tail_hash, s.tail_hash);
-    assert_eq!(outcome.pinned_seq, Some(s.tail_seq - 1));
+    assert_eq!(
+        outcome.authenticated_head,
+        Some(Checkpoint { seq: s.tail_seq - 1, hash: TestCrypto.sha256(&s.headers[0]) })
+    );
     assert_eq!(outcome.quorum_signers, s.threshold);
 }
 
@@ -181,6 +185,7 @@ fn claim_proven_against_mainnet_set() {
         s.start_seq,
         s.start_hash,
         &SpanProof {
+            start_header: None,
             headers: &headers,
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
@@ -189,7 +194,10 @@ fn claim_proven_against_mainnet_set() {
     )
     .unwrap();
     assert_eq!(outcome.claim_ids, vec![TestCrypto.sha256(&s.claim_bytes)]);
-    assert_eq!(outcome.pinned_seq, Some(s.tail_seq - 1));
+    assert_eq!(
+        outcome.authenticated_head,
+        Some(Checkpoint { seq: s.tail_seq - 1, hash: TestCrypto.sha256(&s.headers[0]) })
+    );
 }
 
 #[test]
@@ -207,6 +215,7 @@ fn tampered_mainnet_signature_rejected() {
         s.start_seq,
         s.start_hash,
         &SpanProof {
+            start_header: None,
             headers: &headers,
             tail_envelopes: &envs,
             tail_set: Some(&s.tail_set),
@@ -228,6 +237,7 @@ fn wrong_network_id_rejected() {
         s.start_seq,
         s.start_hash,
         &SpanProof {
+            start_header: None,
             headers: &headers,
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
@@ -251,6 +261,7 @@ fn prefix_fast_path_matches_full_parse_on_mainnet() {
         s.start_seq,
         s.start_hash,
         &SpanProof {
+            start_header: None,
             headers: &headers,
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
@@ -258,7 +269,10 @@ fn prefix_fast_path_matches_full_parse_on_mainnet() {
         },
     )
     .unwrap();
-    assert_eq!(fast.pinned_seq, Some(s.tail_seq - 1));
+    assert_eq!(
+        fast.authenticated_head,
+        Some(Checkpoint { seq: s.tail_seq - 1, hash: TestCrypto.sha256(&s.headers[0]) })
+    );
     // Full parse (claims present): must agree on the pin.
     let claims = &[(&s.claim_bytes[..], s.claim_index)];
     let full = verify_span(
@@ -267,6 +281,7 @@ fn prefix_fast_path_matches_full_parse_on_mainnet() {
         s.start_seq,
         s.start_hash,
         &SpanProof {
+            start_header: None,
             headers: &headers,
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
@@ -274,7 +289,7 @@ fn prefix_fast_path_matches_full_parse_on_mainnet() {
         },
     )
     .unwrap();
-    assert_eq!(full.pinned_seq, fast.pinned_seq);
+    assert_eq!(full.authenticated_head, fast.authenticated_head);
     assert_eq!(full.tail_hash, fast.tail_hash);
     assert_eq!(full.claim_ids, vec![TestCrypto.sha256(&s.claim_bytes)]);
 }
@@ -287,6 +302,7 @@ fn journal_roundtrip_with_mainnet_ids() {
         start_hash: s.start_hash,
         end_seq: s.tail_seq,
         end_hash: s.tail_hash,
+        policy_digest: s.network_id,
         claim_ids: vec![TestCrypto.sha256(&s.claim_bytes)],
     };
     assert_eq!(decode_journal(&encode_journal(&j)).unwrap(), j);

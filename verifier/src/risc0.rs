@@ -8,6 +8,7 @@
 
 use crate::bn128::{Fr, G1, G2};
 use crate::groth16::{Proof, VerifyingKey};
+use ark_bn254::Fq;
 use ark_serialize::CanonicalDeserialize;
 
 // ---------------------------------------------------------------------------
@@ -117,18 +118,20 @@ pub fn seal_to_proof(seal: &[u8]) -> Result<Proof, String> {
 ///
 /// The fifth input is `bn254_control_id` with its bytes reversed, parsed as a
 /// big-endian u256 into `Fr` (risc0-groth16-3.0.5/src/verifier.rs:104-105).
+/// The source returns an error for a non-canonical (≥ scalar modulus) value;
+/// we propagate it — the value is never normalized to another scalar.
 pub fn public_inputs(
     control_root: [u8; 32],
     claim_digest: [u8; 32],
     bn254_control_id: [u8; 32],
-) -> [Fr; 5] {
+) -> Result<[Fr; 5], String> {
     let (a0, a1) = split_digest(control_root);
     let (c0, c1) = split_digest(claim_digest);
     let mut id_be = bn254_control_id;
     id_be.reverse(); // verifier.rs:104 — reverse the digest bytes
-    let id_bn254_fr = fr_from_be(&id_be);
+    let id_bn254_fr = fr_from_be(&id_be)?;
     // Order pinned by verifier.rs:107 `new_inner(&seal, &[a0, a1, c0, c1, id_bn254_fr], ..)`.
-    [a0, a1, c0, c1, id_bn254_fr]
+    Ok([a0, a1, c0, c1, id_bn254_fr])
 }
 
 /// `split_digest` equivalent: returns `(hi, lo)` — the two scalar halves of a
@@ -141,16 +144,13 @@ fn split_digest(d: [u8; 32]) -> (Fr, Fr) {
 
 /// `fr_from_bytes` equivalent for a 32-byte big-endian value
 /// (risc0-groth16-3.0.5/src/verifier.rs:318-323). Non-canonical values
-/// (≥ scalar modulus) are an error in the source; since our signature cannot
-/// return an error, they map to `Fr::ZERO`, which makes Groth16 verification
-/// fail closed — no legitimate scalar equals 0 here, and `seal_to_proof` +
-/// `verify` still reject any crafted seal.
-fn fr_from_be(bytes: &[u8; 32]) -> Fr {
+/// (≥ scalar modulus) are a decode error, exactly as in the source — never
+/// silently normalized to another scalar.
+fn fr_from_be(bytes: &[u8; 32]) -> Result<Fr, String> {
     let mut le = *bytes;
     le.reverse(); // arkworks CanonicalDeserialize reads little-endian
     Fr::deserialize_uncompressed(le.as_slice())
-        .ok()
-        .unwrap_or(Fr::from(0u64))
+        .map_err(|_| "bn254_control_id is not a canonical scalar".to_string())
 }
 
 /// `from_u256` for a decimal string (risc0-groth16-3.0.5/src/lib.rs:135-147):
@@ -180,34 +180,59 @@ fn u256_dec_to_be32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Strict canonical big-endian field decode: `Fq::deserialize_uncompressed`
+/// rejects values ≥ the field modulus and any leftover bits (the raw seal
+/// format has no SWFlags; the point is constructed only after this check, so
+/// the 0x80/0x40 bits can never be silently stripped into a valid point).
+fn fq_be_raw(bytes: &[u8]) -> Result<Fq, String> {
+    let mut little_endian: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "field element must be 32 bytes".to_string())?;
+    little_endian.reverse();
+    Fq::deserialize_uncompressed(little_endian.as_slice())
+        .map_err(|_| "non-canonical field element".to_string())
+}
+
 /// G1 decode replicating `g1_from_bytes`
-/// (risc0-groth16-3.0.5/src/lib.rs:103-115): buffer `x.rev ‖ y.rev` (both
-/// halves little-endian), then `deserialize_uncompressed` (canonical +
-/// on-curve checks included).
+/// (risc0-groth16-3.0.5/src/lib.rs:103-115): raw BE `(x, y)` coordinates,
+/// each parsed strictly as `Fq` (no serialization flags), then the point
+/// checked on-curve, in the prime-order subgroup, and non-identity.
 fn g1_from_be_raw(elem: [&[u8]; 2]) -> Result<G1, ()> {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(elem[0]);
-    buf[..32].reverse();
-    buf[32..].copy_from_slice(elem[1]);
-    buf[32..].reverse();
-    G1::deserialize_uncompressed(buf.as_slice()).map_err(|_| ())
+    let x = fq_be_raw(elem[0]).map_err(|_| ())?;
+    let y = fq_be_raw(elem[1]).map_err(|_| ())?;
+    let p = G1::new_unchecked(x, y);
+    if p.infinity || !p.is_on_curve() || !p.is_in_correct_subgroup_assuming_on_curve() {
+        return Err(());
+    }
+    Ok(p)
 }
 
 /// G2 decode replicating `g2_from_bytes`
-/// (risc0-groth16-3.0.5/src/lib.rs:118-132): buffer is built in the order
-/// `elem[0][1] ‖ elem[0][0] ‖ elem[1][1] ‖ elem[1][0]`, each chunk reversed.
-/// With the source's swap (types.rs:117-120) this yields the *real* G2 point
-/// `(x = Fq2(c0 = elem[0][1], c1 = elem[0][0]), y = Fq2(elem[1][1], elem[1][0]))`.
+/// (risc0-groth16-3.0.5/src/lib.rs:118-132): the raw quad is consumed in the
+/// source order `elem[0][1], elem[0][0], elem[1][1], elem[1][0]`, so the real
+/// point is `(x = Fq2(c0 = elem[0][1], c1 = elem[0][0]),
+/// y = Fq2(elem[1][1], elem[1][0]))`. Each component is parsed strictly as
+/// `Fq`, then the point is checked on-curve, in the prime-order subgroup, and
+/// non-identity.
 fn g2_from_be_raw(elem: [[&[u8]; 2]; 2]) -> Result<G2, ()> {
-    let mut buf = [0u8; 128];
-    for (i, src) in [elem[0][1], elem[0][0], elem[1][1], elem[1][0]]
-        .iter()
-        .enumerate()
-    {
-        buf[i * 32..(i + 1) * 32].copy_from_slice(src);
-        buf[i * 32..(i + 1) * 32].reverse();
+    let c = [
+        fq_be_raw(elem[0][1]),
+        fq_be_raw(elem[0][0]),
+        fq_be_raw(elem[1][1]),
+        fq_be_raw(elem[1][0]),
+    ];
+    if c.iter().any(Result::is_err) {
+        return Err(());
     }
-    G2::deserialize_uncompressed(buf.as_slice()).map_err(|_| ())
+    let [c0, c1, c2, c3] = c.map(Result::unwrap);
+    let p = G2::new_unchecked(
+        ark_bn254::Fq2 { c0, c1 },
+        ark_bn254::Fq2 { c0: c2, c1: c3 },
+    );
+    if p.infinity || !p.is_on_curve() || !p.is_in_correct_subgroup_assuming_on_curve() {
+        return Err(());
+    }
+    Ok(p)
 }
 
 /// VK construction: decimal constant → BE bytes → the same `g?_from_bytes`

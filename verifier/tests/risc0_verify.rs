@@ -298,7 +298,7 @@ fn public_inputs_match_hand_vectors() {
     let claim: [u8; 32] = core::array::from_fn(|i| 255 - i as u8);
     let id: [u8; 32] = core::array::from_fn(|i| i as u8);
 
-    let ins = risc0::public_inputs(ctrl, claim, id);
+    let ins = risc0::public_inputs(ctrl, claim, id).expect("canonical inputs");
 
     // ctrl_hi: d[..16] little-endian  → 0x0f0e…0100
     assert_eq!(ins[0], Fr::from(0x0f0e0d0c0b0a09080706050403020100u128));
@@ -329,4 +329,249 @@ fn public_inputs_match_hand_vectors() {
     ]))
     .expect("unreversed id is canonical");
     assert_ne!(ins[4], unreversed);
+}
+
+// ------------------------------------------- group 5: strict raw encoding
+
+/// Scalar-field modulus (canonical big-endian) — the strict parse boundary.
+/// `Fq::MODULUS` is 2^254 + …, so every scalar is < 2^254 and `into_bigint()`
+/// leaves the top two bits zero; reversing the top byte can never collide
+/// with the SWFlag bit positions (0x40/0x80 of the LE last byte).
+fn fq_modulus_be() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    for (i, limb) in Fq::MODULUS.0.iter().enumerate() {
+        b[24 - i * 8..32 - i * 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    b
+}
+
+#[test]
+fn seal_rejects_swflag_bits_in_raw_coordinates() {
+    let vk = risc0::verifying_key();
+    let mut seal = vec![0u8; 256];
+    encode_g1_into(&vk.alpha_g1, &mut seal[0..64]);
+    encode_g2_into(&vk.beta_g2, &mut seal[64..192]);
+    encode_g1_into(&vk.ic[5], &mut seal[192..256]);
+
+    // Byte 32 = first G1 y coordinate, its top byte (BE): raw format carries
+    // no SWFlags, so the 0x80/0x40 bits are malformed — the old flag-aware
+    // decoder silently stripped them and returned the *valid* original point.
+    let mut s = seal.clone();
+    s[32] |= 0x80;
+    assert!(risc0::seal_to_proof(&s).is_err(), "YIsNegative bit must reject");
+    let mut s = seal.clone();
+    s[32] |= 0x40;
+    assert!(risc0::seal_to_proof(&s).is_err(), "PointAtInfinity bit must reject");
+    // G2 x.c1: raw quad word 0 → seal byte 64.
+    let mut s = seal.clone();
+    s[64] |= 0x80;
+    assert!(risc0::seal_to_proof(&s).is_err(), "G2 flag bit must reject");
+    // c's y coordinate, byte 224.
+    let mut s = seal.clone();
+    s[224] |= 0x80;
+    assert!(risc0::seal_to_proof(&s).is_err(), "c flag bit must reject");
+
+    // The untouched seal still parses — rejections are discriminating.
+    risc0::seal_to_proof(&seal).expect("clean seal still parses");
+}
+
+#[test]
+fn seal_rejects_coordinates_at_or_above_modulus() {
+    let vk = risc0::verifying_key();
+    let q = fq_modulus_be();
+
+    // x ≡ modulus inside an otherwise-valid a encoding: the canonical
+    // decoder rejects before any curve math.
+    let mut s = vec![0u8; 256];
+    encode_g1_into(&vk.alpha_g1, &mut s[0..64]);
+    s[..32].copy_from_slice(&q);
+    assert!(risc0::seal_to_proof(&s).is_err(), "a.x = q");
+
+    // y ≡ modulus in the same valid encoding.
+    let mut s = vec![0u8; 256];
+    encode_g1_into(&vk.alpha_g1, &mut s[0..64]);
+    s[32..64].copy_from_slice(&q);
+    assert!(risc0::seal_to_proof(&s).is_err(), "a.y = q");
+
+    // G2 x.c1 word ≡ modulus inside an otherwise-valid b encoding.
+    let mut s = vec![0u8; 256];
+    encode_g1_into(&vk.alpha_g1, &mut s[0..64]);
+    encode_g2_into(&vk.beta_g2, &mut s[64..192]);
+    s[64..96].copy_from_slice(&q);
+    assert!(risc0::seal_to_proof(&s).is_err(), "b word = q");
+
+    // q − 1 is a legitimate canonical encoding; the decoder alone must
+    // accept it (checked below in LE), while the point built from it is
+    // off-curve and the strict decode rejects that.
+    let mut qm1_be = q;
+    *qm1_be.last_mut().unwrap() -= 1;
+    let mut s = vec![0u8; 256];
+    encode_g1_into(&vk.alpha_g1, &mut s[0..64]);
+    s[..32].copy_from_slice(&qm1_be);
+    assert!(risc0::seal_to_proof(&s).is_err(), "q−1 is off-curve");
+    let mut qm1_le = qm1_be;
+    qm1_le.reverse();
+    assert!(
+        Fq::deserialize_uncompressed(qm1_le.as_slice()).is_ok(),
+        "q−1 is canonical to the decoder"
+    );
+}
+
+#[test]
+fn public_inputs_enforce_scalar_modulus_boundary() {
+    let ctrl = [0u8; 32];
+    let claim = [0u8; 32];
+
+    // Scalar modulus of the curve field (Fr), big-endian — never Fq's.
+    let mut r_be = [0u8; 32];
+    for (i, limb) in <Fr as PrimeField>::MODULUS.0.iter().enumerate() {
+        r_be[24 - i * 8..32 - i * 8].copy_from_slice(&limb.to_be_bytes());
+    }
+
+    // Largest canonical control id: parse value r − 1. public_inputs reverses
+    // the supplied bytes and parses them BE, so supply reverse(r − 1); the
+    // decoded value must be exactly r − 1 — canonical boundary passes.
+    let mut rm1 = r_be;
+    *rm1.last_mut().unwrap() -= 1;
+    let mut id_valid = rm1;
+    id_valid.reverse();
+    let ins = risc0::public_inputs(ctrl, claim, id_valid).expect("r−1 is canonical");
+    let r_minus_one = Fr::from_bigint({
+        let mut b = <Fr as PrimeField>::MODULUS;
+        b.0[0] -= 1;
+        b
+    })
+    .expect("r−1 is canonical");
+    assert_eq!(ins[4], r_minus_one);
+
+    // id parses to r: Err, and never the zero scalar or any reduction.
+    let mut id_r = r_be;
+    id_r.reverse();
+    assert!(risc0::public_inputs(ctrl, claim, id_r).is_err());
+
+    // id parses to r + 1: Err.
+    let mut id_rp1 = r_be;
+    *id_rp1.last_mut().unwrap() += 1;
+    id_rp1.reverse();
+    assert!(risc0::public_inputs(ctrl, claim, id_rp1).is_err());
+}
+
+// ----------------------------------------- group 6: total verify() on junk
+
+// Deterministic search for a genuine on-curve G2 point *outside* the
+// prime-order subgroup: candidates (x, y=0) built via
+// `G2::get_point_from_x_unchecked`; skip the identity (0,0); return the
+// first hit. No synthetic r-scalar multiplication: r·B is the identity
+// (r is the prime-order group order), not a coset element.
+fn wrong_subgroup_g2() -> G2 {
+    for i in 1u64..64 {
+        let p = G2::get_point_from_x_unchecked(
+            ark_bn254::Fq2::new(Fq::from(i), Fq::from(0u64)),
+            false,
+        );
+        if let Some(p) = p {
+            if !p.infinity && p.is_on_curve() && !p.is_in_correct_subgroup_assuming_on_curve()
+            {
+                return p;
+            }
+        }
+    }
+    panic!("deterministic wrong-subgroup G2 search failed");
+}
+
+#[test]
+fn verify_rejects_wrong_subgroup_g2_in_proof_without_host_trap() {
+    testing_env!(VMContextBuilder::new().build());
+    let vk = risc0::verifying_key(); // on-curve, in-subgroup by VK digest check
+
+    // The unchecked G2 reaches verify() directly; without the subgroup
+    // guard the host pairing_check would abort on it.
+    let proof = Proof {
+        a: vk.alpha_g1,
+        b: wrong_subgroup_g2(),
+        c: vk.ic[5],
+    };
+    assert!(proof.b.is_on_curve());
+    assert!(
+        !proof.b.is_in_correct_subgroup_assuming_on_curve(),
+        "search must return a cofactor-coset point"
+    );
+    assert!(!groth16::verify(&vk, &proof, &[Fr::from(0u64); 5]));
+}
+
+#[test]
+fn verify_rejects_wrong_subgroup_g2_in_vk_without_host_trap() {
+    // Same defect class in the *verifying key* exercises the vk-side guard;
+    // sharing one bad point between proof and vk would make the guard
+    // checks indistinguishable.
+    testing_env!(VMContextBuilder::new().build());
+    let vk = risc0::verifying_key();
+    let mut vk_bad = vk.clone();
+    vk_bad.beta_g2 = wrong_subgroup_g2();
+
+    let proof = Proof {
+        a: vk.alpha_g1,
+        b: vk.beta_g2,
+        c: vk.ic[5],
+    };
+    assert!(!groth16::verify(&vk_bad, &proof, &[Fr::from(0u64); 5]));
+}
+
+#[test]
+fn ok_claim_digest_matches_risc0_reference() {
+    use risc0_binfmt::Digestible;
+    use risc0_zkp::core::digest::Digest;
+    use risc0_zkvm::ReceiptClaim; // dev-dep: vendored 3.0.6; ReceiptClaim::ok
+                                  // shape identical to the 3.0.5 source claim.rs
+                                  // cites (receipt.rs:77-95, 326-341)
+
+    testing_env!(VMContextBuilder::new().build());
+
+    let journal = b"epoch-journal-bytes";
+    let image: [u8; 32] = core::array::from_fn(|i| i as u8);
+    let ours = verifier::claim::claim_digest(&verifier::claim::ok_claim(image, journal));
+    let reference: [u8; 32] = ReceiptClaim::ok(Digest::from(image), journal.to_vec())
+        .digest::<Impl>()
+        .as_bytes()
+        .try_into()
+        .unwrap();
+
+    assert_eq!(ours, reference);
+
+    // Discriminating: a different journal or image must diverge.
+    let other = verifier::claim::claim_digest(&verifier::claim::ok_claim(image, b"other"));
+    assert_ne!(ours, other);
+    let other = verifier::claim::claim_digest(&verifier::claim::ok_claim([9u8; 32], journal));
+    assert_ne!(ours, other);
+}
+
+#[test]
+fn genuine_risc0_receipt_verifies_and_binds_public_inputs() {
+    testing_env!(VMContextBuilder::new().build());
+    // Upstream bootstrap-groth16 receipt, not a locally generated toy VK.
+    // The fixture records immutable source URLs and wire transformations.
+    let f: Value = serde_json::from_str(include_str!(
+        "../../testdata/risc0_receipt_fixture.json"
+    )).unwrap();
+    let word = |key: &str| -> [u8; 32] { hex_bytes(&f[key]).try_into().unwrap() };
+    let journal = hex_bytes(&f["journal"]);
+    let claim = verifier::claim::claim_digest(&verifier::claim::ok_claim(
+        word("image_id"), &journal,
+    ));
+    assert_eq!(claim, word("claim_digest"));
+    let inputs = risc0::public_inputs(
+        word("control_root"), claim, word("bn254_control_id"),
+    ).unwrap();
+    let seal = hex_bytes(&f["seal"]);
+    let proof = risc0::seal_to_proof(&seal).unwrap();
+    let vk = risc0::verifying_key();
+    assert!(groth16::verify(&vk, &proof, &inputs));
+    for index in 0..inputs.len() {
+        let mut altered = inputs;
+        altered[index] += Fr::from(1u64);
+        assert!(!groth16::verify(&vk, &proof, &altered), "input {index} is bound");
+    }
+    let mut malformed = seal;
+    malformed[32] |= 0x80;
+    assert!(risc0::seal_to_proof(&malformed).is_err());
 }

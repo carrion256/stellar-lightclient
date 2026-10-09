@@ -65,17 +65,19 @@
   scripts.risc0-setup.exec = ''
     #!/usr/bin/env bash
     # Install the zkVM rustc toolchain that `cargo risczero build` needs.
+    # cargo-risczero 3.0.6 no longer installs it directly (its `install`
+    # subcommand just tells you to use rzup), so bootstrap rzup if absent.
     # Idempotent: safe to run repeatedly. Network-heavy on first run.
     set -euo pipefail
-    if command -v rzup >/dev/null 2>&1; then
-      echo "rzup found — installing the zkVM toolchain"
-      rzup install
-    else
-      echo "rzup not present; using cargo-risczero's own toolchain installer"
-      cargo risczero install
+    export PATH="$HOME/.cargo/bin:$PATH"
+    if ! command -v rzup >/dev/null 2>&1; then
+      echo "rzup not found — installing it with cargo (first run only)"
+      cargo install rzup --locked
     fi
+    echo "installing the zkVM toolchain via rzup"
+    rzup install
     echo
-    echo "done. Build + prove a real seal with:"
-    echo "  cargo risczero build -p guest --features guest/zkvm-entrypoint"
+    echo "done. Build the guest program (receipt proving is a separate step):"
+    echo "  cargo risczero build --manifest-path guest/Cargo.toml --features zkvm-entrypoint"
   '';
 }

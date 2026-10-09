@@ -37,3 +37,9 @@ path = "src/bin/guest.rs"
 # Cargo skips this target entirely unless the feature is on, so native
 # `cargo test -p guest` works without the RISC Zero toolchain.
 required-features = ["zkvm-entrypoint"]
+
+# Standalone workspace: `cargo risczero build` compiles the guest with
+# `--manifest-path guest/Cargo.toml --locked`, which requires a lockfile next
+# to this manifest. Without it the docker build resolves dependencies freely
+# (it picked bincode 2 against bincode-1 API code) and is not reproducible.
+[workspace]
