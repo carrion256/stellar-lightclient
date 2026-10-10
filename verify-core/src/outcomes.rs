@@ -69,11 +69,15 @@ fn push_xdr<T: WriteXdr>(out: &mut Vec<u8>, value: &T) -> Result<(), Error> {
 /// `xdr_to_opaque(mNetworkID, ENVELOPE_TYPE_TX, 0, mEnvelope.v0().tx)` hashes
 /// the same bytes as the v0-to-v1 converted `Transaction`.
 ///
-/// **Coverage gap:** `testdata/fixture.json` contains only v1 envelopes, so the
-/// v1 branch is the only one exercised against real data. The v0 and fee-bump
-/// preimages are transcribed from stellar-core (`TransactionFrame.cpp`,
-/// `FeeBumpTransactionFrame.cpp`) but have no hand-vector yet — do not read
-/// green fixture tests as covering them.
+/// **Coverage:** `testdata/fixture.json` carries 715 authentic mainnet envelopes
+/// whose result rows are hash-bound to their headers. They exercise the v1 (298)
+/// and fee-bump (417) branches against real data — see
+/// `every_result_row_joins_its_envelope_by_contents_hash`. The fixture cannot
+/// cover v0: `ENVELOPE_TYPE_TX_V0` is legacy and no modern ledger produces one.
+/// That branch is proven by independent derivation instead — the v0 preimage
+/// must equal hashing the v0-to-v1 converted `Transaction`, so a missing or
+/// misplaced `0` tag makes the two derivations disagree
+/// (`v0_contents_hash_equals_the_v1_conversion`).
 pub fn tx_contents_hash<C: Crypto>(
     crypto: &C,
     network_id: [u8; 32],
