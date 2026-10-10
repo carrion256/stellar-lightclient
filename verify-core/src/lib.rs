@@ -37,8 +37,13 @@ use stellar_xdr::{
 };
 
 mod journal;
+mod outcomes;
 
 pub use journal::{decode_journal, encode_journal, EpochJournal};
+pub use outcomes::{
+    committed_soroban_hash, decode_result_set, outcome_digest, soroban_success_preimage,
+    tx_contents_hash, verify_outcome_claims,
+};
 
 /// Cryptographic primitives the verifier needs, supplied by the host: NEAR host
 /// functions in the contract, and the guest's own SHA-256 / ed25519
@@ -109,6 +114,21 @@ pub struct SpanProof<'a> {
     /// Inclusion claims `(tx envelope XDR, index)` to prove against the tail's
     /// transaction set.
     pub claims: &'a [(&'a [u8], u32)],
+    /// Outcome claims `(tx envelope XDR, TransactionResultPair XDR)`.
+    ///
+    /// stellar-core emits a `TransactionResultPair` only for a transaction it
+    /// applied, so a proven row implies inclusion: these need no transaction-set
+    /// proof and are not restricted to the tail ledger.
+    pub outcome_claims: &'a [(&'a [u8], &'a [u8])],
+    /// XDR `TransactionResultSet`, bound to the **authenticated head** ledger —
+    /// the one this span pins through signed bytes.
+    ///
+    /// Named `tail_results` because it is the result payload that accompanies a
+    /// span's tail evidence, but it must hash to `tx_set_result_hash` of the
+    /// *authenticated head* header, never of the provisional tail. The quorum
+    /// certificate does not sign `tx_set_result_hash`, so binding outcomes to the
+    /// tail header would let a fabricated result set pass.
+    pub tail_results: Option<&'a [u8]>,
 }
 
 /// What was proven about one span.
@@ -124,6 +144,9 @@ pub struct SpanOutcome {
     pub quorum_signers: u32,
     /// sha256(tx envelope) per proven claim.
     pub claim_ids: Vec<[u8; 32]>,
+    /// sha256 over the canonical `TransactionResultPair` XDR per proven outcome
+    /// claim, in claim order.
+    pub outcome_digests: Vec<[u8; 32]>,
 }
 
 /// One variant per failure of the reference semantics. `Display` carries the
@@ -156,6 +179,18 @@ pub enum Error {
     ClaimIndexOutOfRange { claim: usize, index: u32, len: usize },
     ClaimEnvelopeMismatch { claim: usize, index: u32 },
     MalformedJournal(&'static str),
+    InvalidResultSetXdr,
+    NonCanonicalResultSet,
+    TxSetResultHashMismatch,
+    ResultsRequireAuthenticatedHead,
+    OutcomeResultsMissing,
+    InvalidTxEnvelopeXdr,
+    InvalidOutcomeEnvelopeXdr { outcome: usize },
+    InvalidResultPairXdr { outcome: usize },
+    OutcomeTransactionHashMismatch { outcome: usize },
+    OutcomeNotInResults { outcome: usize },
+    SorobanSuccess(&'static str),
+    XdrEncode,
 }
 
 impl std::fmt::Display for Error {
@@ -225,6 +260,35 @@ impl std::fmt::Display for Error {
             Error::MalformedJournal(reason) => {
                 write!(f, "invalid epoch journal encoding — {reason}")
             }
+            Error::InvalidResultSetXdr => f.write_str("invalid transaction result set xdr"),
+            Error::NonCanonicalResultSet => {
+                f.write_str("transaction result set is not canonical xdr")
+            }
+            Error::TxSetResultHashMismatch => {
+                f.write_str("result set does not hash to the authenticated header")
+            }
+            Error::ResultsRequireAuthenticatedHead => f.write_str(
+                "outcomes require the authenticated head header, not the provisional tail",
+            ),
+            Error::OutcomeResultsMissing => {
+                f.write_str("outcome claims require the tail result set")
+            }
+            Error::InvalidTxEnvelopeXdr => f.write_str("invalid transaction envelope xdr"),
+            Error::InvalidOutcomeEnvelopeXdr { outcome } => {
+                write!(f, "invalid outcome envelope xdr — outcome {outcome}")
+            }
+            Error::InvalidResultPairXdr { outcome } => {
+                write!(f, "invalid transaction result pair xdr — outcome {outcome}")
+            }
+            Error::OutcomeTransactionHashMismatch { outcome } => write!(
+                f,
+                "result pair does not belong to the claimed envelope — outcome {outcome}"
+            ),
+            Error::OutcomeNotInResults { outcome } => {
+                write!(f, "result pair is not an element of the committed set — outcome {outcome}")
+            }
+            Error::SorobanSuccess(reason) => write!(f, "soroban success proof rejected — {reason}"),
+            Error::XdrEncode => f.write_str("xdr encoding failed"),
         }
     }
 }
@@ -248,7 +312,11 @@ pub fn verify_span<C: Crypto>(
     // 1) the headers form a chain from the starting head to the tail.
     let mut prev_seq = start_seq;
     let mut prev_hash = start_hash;
+    let mut prev_result_hash: Option<[u8; 32]> = None;
     let mut pinned_by_set = start_hash;
+    // `tx_set_result_hash` of the header that `pinned_by_set` names: the
+    // authenticated head, and the only header allowed to commit outcomes.
+    let mut pinned_result_hash: Option<[u8; 32]> = None;
     let mut tail: Option<(LedgerHeader, [u8; 32])> = None;
     let mut predecessor_version = None;
     if let Some(raw) = proof.start_header {
@@ -258,6 +326,7 @@ pub fn verify_span<C: Crypto>(
         }
         check_protocol(header.ledger_version, trust)?;
         predecessor_version = Some(header.ledger_version);
+        prev_result_hash = Some(header.tx_set_result_hash.0);
     }
     for (index, raw) in proof.headers.iter().enumerate() {
         let header: LedgerHeader = decode(raw).map_err(|_| Error::InvalidHeaderXdr { index })?;
@@ -274,9 +343,11 @@ pub fn verify_span<C: Crypto>(
         }
         let hash = crypto.sha256(raw);
         let seq = header.ledger_seq;
+        let result_hash = header.tx_set_result_hash.0;
         if index + 1 == proof.headers.len() {
             // `prev_hash` is the point the tail set must pin.
             pinned_by_set = prev_hash;
+            pinned_result_hash = prev_result_hash;
             tail = Some((header, hash));
         } else {
             check_protocol(header.ledger_version, trust)?;
@@ -284,6 +355,7 @@ pub fn verify_span<C: Crypto>(
         }
         prev_seq = seq;
         prev_hash = hash;
+        prev_result_hash = Some(result_hash);
     }
     let (tail_header, tail_hash) = tail.ok_or(Error::EmptySpan)?;
 
@@ -359,12 +431,41 @@ pub fn verify_span<C: Crypto>(
         claim_ids.push(crypto.sha256(&encoded));
     }
 
+    // 5) outcomes bind to the authenticated head, never the provisional tail.
+    //    The quorum certificate signs `StellarValue` — `txSetHash`, `closeTime`,
+    //    `upgrades` — so `tx_set_result_hash` of the tail header is as
+    //    unauthenticated as its `ledger_version`, which is ignored above.
+    //    Binding outcomes here would let a fabricated result set present a
+    //    failed transaction as a success.
+    let mut outcome_digests = Vec::with_capacity(proof.outcome_claims.len());
+    if proof.tail_results.is_some() || !proof.outcome_claims.is_empty() {
+        let results_bytes = proof.tail_results.ok_or(Error::OutcomeResultsMissing)?;
+        // Without the tail set nothing pins any header, so there is no
+        // authenticated head to bind to.
+        if authenticated_head.is_none() {
+            return Err(Error::ResultsRequireAuthenticatedHead);
+        }
+        let pinned_result_hash =
+            pinned_result_hash.ok_or(Error::ResultsRequireAuthenticatedHead)?;
+        if crypto.sha256(results_bytes) != pinned_result_hash {
+            return Err(Error::TxSetResultHashMismatch);
+        }
+        let results = outcomes::decode_result_set(results_bytes)?;
+        outcome_digests = outcomes::verify_outcome_claims(
+            crypto,
+            trust.network_id,
+            &results,
+            proof.outcome_claims,
+        )?;
+    }
+
     Ok(SpanOutcome {
         tail_seq: tail_header.ledger_seq,
         tail_hash,
         authenticated_head,
         quorum_signers,
         claim_ids,
+        outcome_digests,
     })
 }
 
@@ -439,7 +540,7 @@ fn check_quorum<C: Crypto>(
 
 // ---------------------------------------------------------------- decoding helpers
 
-fn decode<T: ReadXdr>(bytes: &[u8]) -> Result<T, stellar_xdr::Error> {
+pub(crate) fn decode<T: ReadXdr>(bytes: &[u8]) -> Result<T, stellar_xdr::Error> {
     let mut reader = Limited::new(Cursor::new(bytes), Limits { depth: 64, len: bytes.len() });
     T::read_xdr_to_end(&mut reader)
 }
@@ -448,10 +549,10 @@ fn try_decode<T: ReadXdr>(bytes: &[u8]) -> Option<T> {
     decode(bytes).ok()
 }
 
-fn encode<T: WriteXdr>(value: &T) -> Result<Vec<u8>, Error> {
+pub(crate) fn encode<T: WriteXdr>(value: &T) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
     let mut writer = Limited::new(&mut buf, Limits::none());
-    value.write_xdr(&mut writer).map_err(|_| Error::NonCanonicalTxSet)?;
+    value.write_xdr(&mut writer).map_err(|_| Error::XdrEncode)?;
     Ok(buf)
 }
 

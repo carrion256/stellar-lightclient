@@ -90,6 +90,8 @@ fn span_proof(close: &serde_json::Value, claim_index: Option<u32>) -> SpanProof 
         tail_envelopes: b64_list(&close["scp_envelopes_b64"]),
         tail_tx_set_xdr: Some(b64(&close["tx_set_xdr_b64"])),
         tx_claims: claims(close, claim_index),
+        outcome_claims: Vec::new(),
+        tail_results_xdr: None,
     }
 }
 
@@ -118,6 +120,8 @@ fn sparse_span(
         tail_envelopes: b64_list(&tail["scp_envelopes_b64"]),
         tail_tx_set_xdr: with_tail_set.then(|| b64(&tail["tx_set_xdr_b64"])),
         tx_claims: claims(tail, claim_index),
+        outcome_claims: Vec::new(),
+        tail_results_xdr: None,
     }
 }
 
@@ -338,6 +342,8 @@ fn raw_borsh_entry_point_matches_json() {
             tx_envelope: b64(&tail["tx_envelope_xdr_b64"]).0.clone(),
             tx_index: num(&tail["tx_index"]),
         }],
+        outcome_claims: Vec::new(),
+        tail_results: None,
     };
     // Exactly the bytes a relayer would place in the call input. `start_header`
     // is the first Borsh field, so its Option tag must lead the encoding.
@@ -357,6 +363,47 @@ fn raw_borsh_entry_point_matches_json() {
     // Borsh call bytes for this span versus the JSON form of the same proof.
     let json_bytes = serde_json::to_string(&span).expect("json encode").len();
     println!("raw {} B vs json {json_bytes} B for the same span", bytes.len());
+}
+
+/// The exact bytes `tools/test_relay.py::test_span_borsh_field_order_and_little_endian`
+/// asserts `tools/relay.py` emits. Decoding them here pins the Python encoder and
+/// the Rust wire layout to one shared vector: if either side changes field order
+/// or drops a field, exactly one of the two tests fails. Without this, the
+/// relayer can quietly produce calldata `submit_span_raw` rejects — which is what
+/// happened when `outcome_claims` and `tail_results` were added.
+#[test]
+fn relay_borsh_layout_matches() {
+    let bytes: &[u8] = &[
+        0x01, 0x02, 0x00, 0x00, 0x00, 0x11, 0x22, //
+        0x02, 0x00, 0x00, 0x00, //
+        0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, //
+        0x05, 0x00, 0x00, 0x00, 0x04, 0x05, 0x06, 0x07, 0x08, //
+        0x01, 0x00, 0x00, 0x00, //
+        0x02, 0x00, 0x00, 0x00, 0x99, 0xaa, //
+        0x01, 0x05, 0x00, 0x00, 0x00, 0xcc, 0xdd, 0xee, 0xff, 0xaa, //
+        0x01, 0x00, 0x00, 0x00, //
+        0x03, 0x00, 0x00, 0x00, 0x10, 0x20, 0x30, //
+        0x04, 0x03, 0x02, 0x01, //
+        0x01, 0x00, 0x00, 0x00, //
+        0x02, 0x00, 0x00, 0x00, 0xaa, 0xbb, //
+        0x03, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, //
+        0x01, 0x04, 0x00, 0x00, 0x00, 0xca, 0xfe, 0xba, 0xbe, //
+    ];
+    let span = SpanProofRaw::try_from_slice(bytes).expect("relayer bytes must decode");
+    assert_eq!(span.start_header, Some(vec![0x11, 0x22]));
+    assert_eq!(
+        span.headers,
+        vec![vec![0x01, 0x02, 0x03], vec![0x04, 0x05, 0x06, 0x07, 0x08]]
+    );
+    assert_eq!(span.tail_envelopes, vec![vec![0x99, 0xaa]]);
+    assert_eq!(span.tail_tx_set, Some(vec![0xcc, 0xdd, 0xee, 0xff, 0xaa]));
+    assert_eq!(span.tx_claims.len(), 1);
+    assert_eq!(span.tx_claims[0].tx_envelope, vec![0x10, 0x20, 0x30]);
+    assert_eq!(span.tx_claims[0].tx_index, 0x01020304);
+    assert_eq!(span.outcome_claims.len(), 1);
+    assert_eq!(span.outcome_claims[0].tx_envelope, vec![0xaa, 0xbb]);
+    assert_eq!(span.outcome_claims[0].tx_result, vec![0xde, 0xad, 0xbe]);
+    assert_eq!(span.tail_results, Some(vec![0xca, 0xfe, 0xba, 0xbe]));
 }
 
 
@@ -616,6 +663,7 @@ fn epoch_journal(
         end_seq,
         end_hash,
         claim_ids: vec![[0x0cu8; 32], [0x0du8; 32]],
+        outcome_digests: Vec::new(),
     })
 }
 

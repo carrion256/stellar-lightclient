@@ -82,6 +82,13 @@ pub struct SpanProof {
     pub tail_tx_set_xdr: Option<Base64VecU8>,
     /// Inclusion claims to prove against the tail's transaction set.
     pub tx_claims: Vec<TxClaim>,
+    /// Outcome claims `(tx envelope, TransactionResultPair)` proven against
+    /// [`SpanProof::tail_results_xdr`]. A result row exists only for a
+    /// transaction the network applied, so these also prove inclusion.
+    pub outcome_claims: Vec<OutcomeClaim>,
+    /// XDR `TransactionResultSet` for the **authenticated head** ledger — the one
+    /// the span pins through signed bytes, never the provisional tail header.
+    pub tail_results_xdr: Option<Base64VecU8>,
 }
 
 /// Claim that `tx_envelope_xdr` is the transaction at `tx_index` of the set.
@@ -90,6 +97,15 @@ pub struct SpanProof {
 pub struct TxClaim {
     pub tx_envelope_xdr: Base64VecU8,
     pub tx_index: u32,
+}
+
+/// Claim that `tx_envelope_xdr` had the outcome recorded in `tx_result_xdr`, a
+/// `TransactionResultPair` element of the authenticated result set.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct OutcomeClaim {
+    pub tx_envelope_xdr: Base64VecU8,
+    pub tx_result_xdr: Base64VecU8,
 }
 
 // ------------------------------------------------------------------ raw (Borsh) args
@@ -105,12 +121,20 @@ pub struct SpanProofRaw {
     pub tail_envelopes: Vec<Vec<u8>>,
     pub tail_tx_set: Option<Vec<u8>>,
     pub tx_claims: Vec<TxClaimRaw>,
+    pub outcome_claims: Vec<OutcomeClaimRaw>,
+    pub tail_results: Option<Vec<u8>>,
 }
 
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub struct TxClaimRaw {
     pub tx_envelope: Vec<u8>,
     pub tx_index: u32,
+}
+
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
+pub struct OutcomeClaimRaw {
+    pub tx_envelope: Vec<u8>,
+    pub tx_result: Vec<u8>,
 }
 
 // -------------------------------------------------------------------------- results
@@ -129,6 +153,9 @@ pub struct SpanEvidence {
     pub quorum_signers: u32,
     /// sha256(tx envelope) per proven claim — returned, never stored.
     pub claimed_tx_ids: Vec<Base64VecU8>,
+    /// sha256 over the canonical `TransactionResultPair` XDR per proven outcome
+    /// claim, in claim order — returned, never stored.
+    pub outcome_digests: Vec<Base64VecU8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,6 +221,12 @@ pub struct ClaimEvidence {
     /// envelope bytes in the tail set; it proves nothing about the operation
     /// inside.
     pub claim_ids: Vec<Base64VecU8>,
+    /// Outcome IDs: `sha256` over the canonical `TransactionResultPair` XDR per
+    /// proven outcome claim. A committed digest plus a supplied pair whose
+    /// `transaction_hash` matches `tx_contents_hash(envelope)` is the proof that
+    /// that transaction had that outcome. Like `claim_ids`, zeroed when
+    /// unverified.
+    pub outcome_ids: Vec<Base64VecU8>,
 }
 
 #[near(contract_state)]
@@ -277,6 +310,13 @@ impl LightClient {
             .iter()
             .map(|c| (c.tx_envelope_xdr.0.as_slice(), c.tx_index))
             .collect();
+        let outcome_claims: Vec<(&[u8], &[u8])> = span
+            .outcome_claims
+            .iter()
+            .map(|c| {
+                (c.tx_envelope_xdr.0.as_slice(), c.tx_result_xdr.0.as_slice())
+            })
+            .collect();
         let evidence = self.verify_span_core(
             span.start_header.as_ref().map(|h| h.0.as_slice()),
             self.head_seq,
@@ -285,6 +325,8 @@ impl LightClient {
             &envelopes,
             span.tail_tx_set_xdr.as_ref().map(|s| s.0.as_slice()),
             &claims,
+            &outcome_claims,
+            span.tail_results_xdr.as_ref().map(|s| s.0.as_slice()),
         );
         self.persist_authenticated_head(&evidence);
         evidence
@@ -312,6 +354,11 @@ impl LightClient {
             .iter()
             .map(|c| (c.tx_envelope.as_slice(), c.tx_index))
             .collect();
+        let outcome_claims: Vec<(&[u8], &[u8])> = span
+            .outcome_claims
+            .iter()
+            .map(|c| (c.tx_envelope.as_slice(), c.tx_result.as_slice()))
+            .collect();
         let evidence = self.verify_span_core(
             span.start_header.as_deref(),
             self.head_seq,
@@ -320,6 +367,8 @@ impl LightClient {
             &envelopes,
             span.tail_tx_set.as_deref(),
             &claims,
+            &outcome_claims,
+            span.tail_results.as_deref(),
         );
         self.persist_authenticated_head(&evidence);
         evidence
@@ -344,6 +393,13 @@ impl LightClient {
             .iter()
             .map(|c| (c.tx_envelope_xdr.0.as_slice(), c.tx_index))
             .collect();
+        let outcome_claims: Vec<(&[u8], &[u8])> = span
+            .outcome_claims
+            .iter()
+            .map(|c| {
+                (c.tx_envelope_xdr.0.as_slice(), c.tx_result_xdr.0.as_slice())
+            })
+            .collect();
         self.verify_span_core(
             span.start_header.as_ref().map(|h| h.0.as_slice()),
             head_seq,
@@ -352,6 +408,8 @@ impl LightClient {
             &envelopes,
             span.tail_tx_set_xdr.as_ref().map(|s| s.0.as_slice()),
             &claims,
+            &outcome_claims,
+            span.tail_results_xdr.as_ref().map(|s| s.0.as_slice()),
         )
     }
 
@@ -434,6 +492,8 @@ impl LightClient {
         tail_envelopes: &[&[u8]],
         tail_set: Option<&[u8]>,
         claims: &[(&[u8], u32)],
+        outcome_claims: &[(&[u8], &[u8])],
+        tail_results: Option<&[u8]>,
     ) -> SpanEvidence {
         let proof = verify_core::SpanProof {
             start_header,
@@ -441,6 +501,8 @@ impl LightClient {
             tail_envelopes,
             tail_set,
             claims,
+            outcome_claims,
+            tail_results,
         };
         let outcome =
             match verify_core::verify_span(&NearCrypto, &self.trust(), start_seq, start_hash, &proof)
@@ -458,6 +520,11 @@ impl LightClient {
             quorum_signers: outcome.quorum_signers,
             claimed_tx_ids: outcome
                 .claim_ids
+                .iter()
+                .map(|id| Base64VecU8(id.to_vec()))
+                .collect(),
+            outcome_digests: outcome
+                .outcome_digests
                 .iter()
                 .map(|id| Base64VecU8(id.to_vec()))
                 .collect(),
@@ -619,6 +686,7 @@ impl LightClient {
             end_seq: 0,
             end_hash: Base64VecU8(Vec::new()),
             claim_ids: Vec::new(),
+            outcome_ids: Vec::new(),
         };
         let Some(epoch) = self.bind_epoch(&journal, claim_digest) else {
             env::log_str("claim not bound: image, policy, or checkpoint mismatch");
@@ -646,6 +714,11 @@ impl LightClient {
             end_hash: Base64VecU8(epoch.end_hash.to_vec()),
             claim_ids: epoch
                 .claim_ids
+                .iter()
+                .map(|id| Base64VecU8(id.to_vec()))
+                .collect(),
+            outcome_ids: epoch
+                .outcome_digests
                 .iter()
                 .map(|id| Base64VecU8(id.to_vec()))
                 .collect(),

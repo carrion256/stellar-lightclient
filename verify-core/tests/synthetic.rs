@@ -221,7 +221,15 @@ fn run<'a>(
 ) -> Result<SpanOutcome, Error> {
     let trust =
         Trust { network_id: NETWORK_ID, trusted_nodes: c.trusted.clone(), threshold, max_protocol_version: MAX_PROTOCOL };
-    let proof = SpanProof { start_header: None, headers, tail_envelopes: envelopes, tail_set, claims };
+    let proof = SpanProof {
+        start_header: None,
+        headers,
+        tail_envelopes: envelopes,
+        tail_set,
+        claims,
+        outcome_claims: &[],
+        tail_results: None,
+    };
     verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof)
 }
 
@@ -260,6 +268,8 @@ fn wrong_start_hash_breaks_the_chain() {
         tail_envelopes: &refs(&c.envelopes),
         tail_set: Some(&c.tail_set),
         claims: &[],
+        outcome_claims: &[],
+        tail_results: None,
     };
     let err = verify_span(&TestCrypto, &trust, c.start_seq, bad, &proof).unwrap_err();
     assert_eq!(err, Error::PreviousLedgerHashMismatch { index: 0 });
@@ -285,6 +295,8 @@ fn tampered_intermediate_header_is_rejected() {
         tail_envelopes: &refs(&c.envelopes),
         tail_set: Some(&c.tail_set),
         claims: &[],
+        outcome_claims: &[],
+        tail_results: None,
     };
     let err = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap_err();
     assert_eq!(err, Error::PreviousLedgerHashMismatch { index: 1 });
@@ -389,6 +401,8 @@ fn wrong_network_id_hard_fails() {
         tail_envelopes: &refs(&c.envelopes),
         tail_set: Some(&c.tail_set),
         claims: &[],
+        outcome_claims: &[],
+        tail_results: None,
     };
     let err = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap_err();
     assert_eq!(err, Error::InvalidValidatorSignature { index: 0 });
@@ -635,6 +649,8 @@ fn protocol_20_upgrade_on_pre_v20_predecessor_is_accepted() {
         tail_envelopes: &[env.as_slice()],
         tail_set: Some(&c.tail_set),
         claims: &[],
+        outcome_claims: &[],
+        tail_results: None,
     };
     let outcome = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap();
     assert_eq!(outcome.authenticated_head, Some(Checkpoint { seq: 11, hash: start_hash }));
@@ -649,10 +665,13 @@ fn journal_roundtrip_and_garbage() {
         end_hash: [2u8; 32],
         policy_digest: [5u8; 32],
         claim_ids: vec![[3u8; 32], [4u8; 32]],
+        outcome_digests: vec![[7u8; 32]],
     };
     let bytes = encode_journal(&j);
-    assert_eq!(bytes.len(), 112 + 64);
-    assert_eq!(&bytes[..4], &1u32.to_le_bytes(), "explicit v1 prefix");
+    // 112-byte prefix through claim_count, + 2 claim ids, + the 4-byte
+    // outcome count, + 1 outcome digest.
+    assert_eq!(bytes.len(), 116 + 3 * 32);
+    assert_eq!(&bytes[..4], &2u32.to_le_bytes(), "explicit v2 prefix");
     assert_eq!(decode_journal(&bytes).unwrap(), j);
 
     let empty = EpochJournal {
@@ -662,8 +681,9 @@ fn journal_roundtrip_and_garbage() {
         end_hash: [0u8; 32],
         policy_digest: [5u8; 32],
         claim_ids: vec![],
+        outcome_digests: vec![],
     };
-    assert_eq!(bytes.len() - 64, encode_journal(&empty).len());
+    assert_eq!(bytes.len() - 3 * 32, encode_journal(&empty).len());
     assert_eq!(decode_journal(&encode_journal(&empty)).unwrap(), empty);
 
     // v0 (version-less 76-byte header + 2 claim ids) is rejected by version
@@ -684,13 +704,11 @@ fn journal_roundtrip_and_garbage() {
     // A short v0 blob is rejected too — never treated as truncated v1.
     assert!(decode_journal(&v0[..76]).is_err());
 
-    // Trailing garbage rejected.
+    // Trailing garbage rejected. The specific reason text is not the contract;
+    // rejection is.
     let mut bad = encode_journal(&empty);
     bad.push(0);
-    assert_eq!(
-        decode_journal(&bad),
-        Err(Error::MalformedJournal("trailing bytes after claim ids"))
-    );
+    assert!(matches!(decode_journal(&bad), Err(Error::MalformedJournal(_))));
 
     // Truncated input rejected.
     let bad = encode_journal(&j)[..100].to_vec();
@@ -722,6 +740,8 @@ fn attacker_zero_threshold_is_rejected_before_any_signature_check() {
         tail_envelopes: &refs(&c.envelopes),
         tail_set: Some(&c.tail_set),
         claims: &[],
+        outcome_claims: &[],
+        tail_results: None,
     };
     let err = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap_err();
     assert_eq!(err, Error::InvalidTrust("threshold outside trusted node count"));
@@ -804,6 +824,8 @@ fn anchored_single_header_claim_verifies_and_tampered_anchor_fails() {
         tail_envelopes: &envs,
         tail_set: Some(&c.tail_set),
         claims: &[(&c.tx0[..], 0u32)],
+        outcome_claims: &[],
+        tail_results: None,
     };
     let outcome = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap();
     assert_eq!(outcome.claim_ids, vec![TestCrypto.sha256(&c.tx0)]);
@@ -818,6 +840,8 @@ fn anchored_single_header_claim_verifies_and_tampered_anchor_fails() {
         tail_envelopes: &envs,
         tail_set: Some(&c.tail_set),
         claims: &[(&c.tx0[..], 0u32)],
+        outcome_claims: &[],
+        tail_results: None,
     };
     let err = verify_span(&TestCrypto, &trust, c.start_seq, c.start_hash, &proof).unwrap_err();
     assert_eq!(err, Error::InvalidStartHeader);

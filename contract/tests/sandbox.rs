@@ -74,6 +74,8 @@ fn span_json(first: &Value, tail: &Value) -> Value {
             "tx_envelope_xdr": b64_field(&tail["tx_envelope_xdr_b64"]),
             "tx_index": tail["tx_index"],
         }],
+        "outcome_claims": [],
+        "tail_results_xdr": Value::Null,
     })
 }
 
@@ -482,6 +484,7 @@ fn epoch_journal_for(
         end_seq: head_seq + 2,
         end_hash: [0xBB; 32],
         claim_ids: vec![[0x0C; 32], [0x0D; 32]],
+        outcome_digests: Vec::new(),
     })
 }
 
@@ -853,6 +856,8 @@ async fn e2e_borsh_raw_span_submission_advances_the_head() -> anyhow::Result<()>
             tx_envelope: b64_decode(&b64_field(&tail["tx_envelope_xdr_b64"])),
             tx_index: num(&tail["tx_index"]),
         }],
+        outcome_claims: Vec::new(),
+        tail_results: None,
     };
     let mut bytes = Vec::new();
     raw.serialize(&mut bytes).expect("borsh encode");
@@ -920,6 +925,8 @@ async fn e2e_forged_tail_hash_is_never_persisted() -> anyhow::Result<()> {
                 "tail_envelopes": b64_list(&close["scp_envelopes_b64"]),
                 "tail_tx_set_xdr": b64_field(&close["tx_set_xdr_b64"]),
                 "tx_claims": [],
+                "outcome_claims": [],
+                "tail_results_xdr": Value::Null,
             }
         }))
         .transact()

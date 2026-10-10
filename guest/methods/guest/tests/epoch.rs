@@ -7,8 +7,11 @@ use std::io::Cursor;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::Value;
-use stellar_xdr::{LedgerHeader, Limited, Limits, PublicKey, ReadXdr, ScpEnvelope, ScpStatementPledges};
-use verify_core::{trust_digest, validate_trust, Crypto, Error, Trust};
+use stellar_xdr::{
+    LedgerHeader, Limited, Limits, PublicKey, ReadXdr, ScpEnvelope, ScpStatementPledges,
+    TransactionResultSet, WriteXdr,
+};
+use verify_core::{trust_digest, tx_contents_hash, validate_trust, Crypto, Error, Trust};
 
 use guest::{run_epoch, EpochInput, Sha256Dalek, SpanInput};
 use verify_core::{decode_journal, encode_journal};
@@ -113,6 +116,8 @@ fn epoch_input(fixture: &Value) -> EpochInput {
                     close["tx_index"].as_u64().unwrap() as u32,
                 )]
             },
+            outcome_claims: vec![],
+            tail_results: None,
         })
         .collect();
 
@@ -276,4 +281,34 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
     let mut oversized = bytes;
     oversized[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(guest::run_epoch_bytes(&oversized).is_err());
+}
+
+#[test]
+fn outcome_claims_land_in_the_journal() {
+    let fixture = fixture();
+    let mut input = epoch_input(&fixture);
+    let closes = fixture["closes"].as_array().unwrap();
+    let first = &closes[0];
+
+    // Span 1's authenticated head is close[0], supplied there as `start_header`,
+    // so the result set that may commit outcomes is close[0]'s.
+    let results = b64(&first["results_xdr_b64"]);
+    let envelope = b64(&first["tx_envelope_xdr_b64"]);
+    let want = tx_contents_hash(&Sha256Dalek, network_id(&fixture), &envelope).unwrap();
+    let set: TransactionResultSet = decode(&results);
+    let pair = set
+        .results
+        .iter()
+        .find(|r| r.transaction_hash.0 == want)
+        .expect("head result set has the highlighted row");
+    let mut pair_bytes = Vec::new();
+    pair.write_xdr(&mut Limited::new(&mut pair_bytes, Limits::none())).unwrap();
+
+    input.spans[1].outcome_claims = vec![(envelope, pair_bytes.clone())];
+    input.spans[1].tail_results = Some(results);
+
+    let journal = run_epoch(&input).expect("epoch with an outcome claim verifies");
+    assert_eq!(journal.outcome_digests, vec![Sha256Dalek.sha256(&pair_bytes)]);
+    // A result row implies inclusion, so no extra claim id is manufactured.
+    assert_eq!(journal.claim_ids.len(), input.spans[1].claims.len());
 }

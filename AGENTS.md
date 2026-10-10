@@ -35,7 +35,7 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
 |---|---|
 | contract wasm | `cargo build -p stellar-light-client --release --target wasm32-unknown-unknown` |
 | workspace tests, including NEAR sandbox | `cargo test --workspace` |
-| standalone guest tests | `cargo test --manifest-path guest/Cargo.toml` |
+| standalone guest tests | `cargo test --manifest-path guest/methods/guest/Cargo.toml` |
 | relayer tests | `python3 -m unittest discover -s tools -p test_relay.py` |
 | zkVM guest toolchain | `risc0-setup` |
 | build guest program (does not prove a receipt) | `cargo risczero build --manifest-path guest/Cargo.toml --features zkvm-entrypoint` |
@@ -78,11 +78,42 @@ the `r0vm --elf` CLI proves even when no receipt output path is supplied.
   starting checkpoint. Multi-header claims obtain that predecessor from the
   span. Protocol checks use authenticated predecessors and signed upgrades,
   not the unsigned tail version.
-- Epoch journals are version 1 and commit the trust-policy digest. `new` now
-  requires `epoch_image_id`; `verify_claim` derives a canonical successful
-  receipt claim itself and no longer accepts serialized claim bytes. It checks
-  the configured image, current policy and starting checkpoint before pairing.
-  Unverified evidence exposes no decoded epoch checkpoint or claim IDs.
+- **Outcome claims** prove what a transaction *did*, not just that it was
+  submitted. An outcome claim is `(tx envelope, TransactionResultPair)`, and it
+  needs no transaction-set proof: stellar-core emits a result row only for a
+  transaction it applied, so the row implies inclusion. Two bindings make it
+  sound — the row's `transaction_hash` must equal `tx_contents_hash(network_id,
+  envelope)`, and the row must be an element of the committed result set, so a
+  `TxFailed` cannot be re-presented as `TxSuccess`.
+- Outcomes bind to the **authenticated head** header, never the tail. The quorum
+  certificate signs `StellarValue` (`txSetHash`, `closeTime`, `upgrades`), so
+  `tx_set_result_hash` of the tail header is as unauthenticated as the tail's
+  `ledger_version`, which is ignored. Binding outcomes to the tail would let
+  anyone take real headers, a real certificate and a real transaction set,
+  rewrite only the tail header's `tx_set_result_hash`, and present a failed
+  payment as a success. The one-span lag is inherent to sparse verification: the
+  outcome for ledger L is provable in the span whose authenticated head is L.
+- `tx_set_result_hash` is `sha256` of the whole canonical
+  `TransactionResultSet`, vector count included — a plain `xdrSha256`, with no
+  generalized/legacy split like the transaction-set hashing.
+  `TransactionResultPair.transaction_hash` is stellar-core's
+  `getContentsHash()`: the network-bound signature-payload hash, **not** the
+  envelope hash that `claim_id` uses. The two never compare equal; join on the
+  contents hash. `tx_contents_hash` reproduces the preimage exactly, including
+  the extra `0` tag in the v0 form and `ENVELOPE_TYPE_TX_FEE_BUMP` for fee
+  bumps.
+- Soroban receipt events are committed: `InvokeHostFunctionResult::Success(Hash)`
+  is `sha256(InvokeHostFunctionSuccessPreImage)`, and that preimage carries both
+  `return_value` and the emitted `ContractEvent`s. `soroban_success_preimage`
+  checks a supplied preimage against a proven result pair — one `sha256`.
+  `TransactionMeta` (balance and trustline deltas, diagnostic events) is *not*
+  header-committed, so effects remain unprovable.
+- Epoch journals are version 2 and commit the trust-policy digest plus, per
+  proven outcome claim, `sha256` over the canonical `TransactionResultPair` XDR.
+  `new` now requires `epoch_image_id`; `verify_claim` derives a canonical
+  successful receipt claim itself and no longer accepts serialized claim bytes.
+  It checks the configured image, current policy and starting checkpoint before
+  pairing. Unverified evidence exposes no decoded epoch checkpoint or claim IDs.
 - `verify_receipt` verifies a RISC Zero success receipt for a caller-named
   image and journal: the claim digest is derived on-chain and the exit code is
   fixed to `Halted(0)`. It is not epoch-bound and proves nothing about Stellar;

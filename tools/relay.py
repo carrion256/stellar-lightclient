@@ -69,6 +69,8 @@ def build_span(proof: dict, tail_index: int, with_claims: bool) -> dict:
         "tail_envelopes": tail["scp_envelopes_b64"],
         "tail_tx_set_xdr": tail["tx_set_xdr_b64"],
         "tx_claims": [],
+        "outcome_claims": [],
+        "tail_results_xdr": None,
     }
     if with_claims and tail.get("tx_envelope_xdr_b64") is not None:
         span["tx_claims"].append(
@@ -96,6 +98,33 @@ def build_span(proof: dict, tail_index: int, with_claims: bool) -> dict:
         b64(claim["tx_envelope_xdr"], "tx_envelope_xdr")
         if type(claim["tx_index"]) is not int or not 0 <= claim["tx_index"] <= 0xFFFFFFFF:
             raise ValueError("tx_index: expected a u32 integer")
+    for claim in proof.get("outcome_claims", []):
+        if not isinstance(claim, dict):
+            raise ValueError("outcome_claims: expected objects")
+        entry = {
+            "tx_envelope_xdr": claim.get("tx_envelope_xdr"),
+            "tx_result_xdr": claim.get("tx_result_xdr"),
+        }
+        b64(entry["tx_envelope_xdr"], "tx_envelope_xdr")
+        b64(entry["tx_result_xdr"], "tx_result_xdr")
+        span["outcome_claims"].append(entry)
+    if span["outcome_claims"]:
+        # Outcomes bind to the *authenticated head* — the ledger before the tail
+        # — never the tail header, whose `tx_set_result_hash` the quorum
+        # certificate does not sign. Its result set must be supplied.
+        head_index = tail_index - 1
+        head_results = (
+            closes[head_index].get("results_xdr_b64") if head_index >= 0 else None
+        )
+        if head_results is None:
+            raise ValueError(
+                "outcome claims require the authenticated head ledger's result set: "
+                "this proof carries no results_xdr_b64 for the ledger before the tail "
+                "(a single-header span's head is the start header, whose results are "
+                "not in the fixture)"
+            )
+        b64(head_results, "results_xdr_b64")
+        span["tail_results_xdr"] = head_results
     return span
 
 
@@ -108,7 +137,10 @@ def borsh_vec_bytes(items: list) -> bytes:
 
 
 def encode_borsh(span: dict) -> bytes:
-    """SpanProofRaw: start-header Option, headers, envelopes, set Option, claims."""
+    """SpanProofRaw: start-header Option, headers, envelopes, set Option, claims,
+    outcome claims, results Option. Field order is the wire format — this must
+    match `SpanProofRaw` in `contract/src/lib.rs` exactly, or `submit_span_raw`
+    rejects the relayer's own calldata."""
     def option(value):
         return b"\x00" if value is None else b"\x01" + borsh_bytes(b64(value))
 
@@ -120,6 +152,11 @@ def encode_borsh(span: dict) -> bytes:
     for claim in span["tx_claims"]:
         out += borsh_bytes(b64(claim["tx_envelope_xdr"]))
         out += struct.pack("<I", claim["tx_index"])
+    out += struct.pack("<I", len(span["outcome_claims"]))
+    for claim in span["outcome_claims"]:
+        out += borsh_bytes(b64(claim["tx_envelope_xdr"]))
+        out += borsh_bytes(b64(claim["tx_result_xdr"]))
+    out += option(span["tail_results_xdr"])
     return out
 
 

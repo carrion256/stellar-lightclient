@@ -49,6 +49,11 @@ pub struct SpanInput {
     pub tail_envelopes: Vec<Vec<u8>>,
     pub tail_set: Option<Vec<u8>>,
     pub claims: Vec<(Vec<u8>, u32)>,
+    /// Outcome claims `(tx envelope XDR, TransactionResultPair XDR)`, proven
+    /// against [`SpanInput::tail_results`].
+    pub outcome_claims: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `TransactionResultSet` XDR for the **authenticated head** ledger.
+    pub tail_results: Option<Vec<u8>>,
 }
 
 /// Everything the guest needs to attest an epoch. Field order is the relayer
@@ -80,6 +85,7 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
     let mut start_seq = input.start_seq;
     let mut start_hash = input.start_hash;
     let mut claim_ids = Vec::new();
+    let mut outcome_digests = Vec::new();
 
     for span in &input.spans {
         let headers: Vec<&[u8]> = span.headers.iter().map(|h| h.as_slice()).collect();
@@ -93,6 +99,11 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
             .iter()
             .map(|(c, i)| (c.as_slice(), *i))
             .collect();
+        let outcome_claims: Vec<(&[u8], &[u8])> = span
+            .outcome_claims
+            .iter()
+            .map(|(e, p)| (e.as_slice(), p.as_slice()))
+            .collect();
 
         let proof = SpanProof {
             start_header: span.start_header.as_deref(),
@@ -100,10 +111,13 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
             tail_envelopes: &tail_envelopes,
             tail_set: span.tail_set.as_deref(),
             claims: &claims,
+            outcome_claims: &outcome_claims,
+            tail_results: span.tail_results.as_deref(),
         };
         let outcome = verify_span(crypto, &input.trust, start_seq, start_hash, &proof)?;
 
         claim_ids.extend_from_slice(&outcome.claim_ids);
+        outcome_digests.extend_from_slice(&outcome.outcome_digests);
         // Chaining follows the working tail; the journal commits only the
         // latest authenticated checkpoint, never an unauthenticated end.
         if let Some(head) = outcome.authenticated_head {
@@ -120,6 +134,7 @@ pub fn run_epoch_with<C: Crypto>(crypto: &C, input: &EpochInput) -> Result<Epoch
         end_hash: authenticated_head.hash,
         policy_digest,
         claim_ids,
+        outcome_digests,
     })
 }
 

@@ -74,6 +74,8 @@ def base_span(**overrides):
         "tail_envelopes": [],
         "tail_tx_set_xdr": None,
         "tx_claims": [],
+        "outcome_claims": [],
+        "tail_results_xdr": None,
     }
     span.update(overrides)
     return span
@@ -100,14 +102,20 @@ class EncodingTests(unittest.TestCase):
     def test_empty_bytes_some_vs_none(self):
         none = relay.encode_borsh(base_span())
         empty = relay.encode_borsh(base_span(tail_tx_set_xdr=""))
-        # tail-set option sits after the two empty vecs: 00 | 00000000 | 00000000 | OPT | claims
-        self.assertEqual(none, b"\x00" + b"\x00" * 8 + b"\x00" + b"\x00" * 4)
-        self.assertEqual(empty, b"\x00" + b"\x00" * 8 + b"\x01" + b"\x00" * 8)
+        # Layout: start_header | headers | envelopes | tail-set opt | claims |
+        # outcome_claims | results opt.
+        tail = b"\x00" * 4 + b"\x00" * 4 + b"\x00"
+        self.assertEqual(none, b"\x00" + b"\x00" * 8 + b"\x00" + tail)
+        self.assertEqual(empty, b"\x00" + b"\x00" * 8 + b"\x01" + b"\x00" * 4 + tail)
 
     def test_start_header_is_first_borsh_field(self):
         raw = b"AB"
         enc = relay.encode_borsh(base_span(start_header=base64.b64encode(raw).decode()))
-        self.assertEqual(enc, b"\x01\x02\x00\x00\x00" + raw + b"\x00" * 8 + b"\x00\x00\x00\x00\x00")
+        tail = b"\x00" * 4 + b"\x00" * 4 + b"\x00"
+        self.assertEqual(
+            enc,
+            b"\x01\x02\x00\x00\x00" + raw + b"\x00" * 8 + b"\x00" + tail,
+        )
 
     def test_span_borsh_field_order_and_little_endian(self):
         span = base_span(
@@ -122,12 +130,19 @@ class EncodingTests(unittest.TestCase):
                 "tx_envelope_xdr": base64.b64encode(b"\x10\x20\x30").decode(),
                 "tx_index": 0x01020304,
             }],
+            outcome_claims=[{
+                "tx_envelope_xdr": base64.b64encode(b"\xaa\xbb").decode(),
+                "tx_result_xdr": base64.b64encode(b"\xde\xad\xbe").decode(),
+            }],
+            tail_results_xdr=base64.b64encode(b"\xca\xfe\xba\xbe").decode(),
         )
         # Expected bytes hand-written from the Rust wire layout (not the
         # encoder): SpanProofRaw { start_header: Option<Vec<u8>>,
         # headers: Vec<Vec<u8>>, tail_envelopes: Vec<Vec<u8>>,
-        # tail_tx_set: Option<Vec<u8>>, tx_claims: Vec<TxClaimRaw> } and
-        # TxClaimRaw { tx_envelope: Vec<u8>, tx_index: u32 }.
+        # tail_tx_set: Option<Vec<u8>>, tx_claims: Vec<TxClaimRaw>,
+        # outcome_claims: Vec<OutcomeClaimRaw>, tail_results: Option<Vec<u8>> }.
+        # `contract/src/tests.rs::relay_borsh_layout_matches` decodes these
+        # same bytes, so the Python and Rust sides cannot drift apart.
         expected = (
             b"\x01\x02\x00\x00\x00\x11\x22"   # start_header Some, len 2
             b"\x02\x00\x00\x00"               # headers: 2
@@ -139,6 +154,10 @@ class EncodingTests(unittest.TestCase):
             b"\x01\x00\x00\x00"               # tx_claims: 1
             b"\x03\x00\x00\x00\x10\x20\x30"   #   tx_envelope, len 3
             b"\x04\x03\x02\x01"               #   tx_index 0x01020304, u32 LE
+            b"\x01\x00\x00\x00"               # outcome_claims: 1
+            b"\x02\x00\x00\x00\xaa\xbb"       #   tx_envelope, len 2
+            b"\x03\x00\x00\x00\xde\xad\xbe"   #   tx_result, len 3
+            b"\x01\x04\x00\x00\x00\xca\xfe\xba\xbe"  # tail_results Some, len 4
         )
         self.assertEqual(relay.encode_borsh(span), expected)
 
@@ -155,6 +174,52 @@ class EncodingTests(unittest.TestCase):
     def test_no_claims_single_header_ok(self):
         span = relay.build_span(proof(n=1), 0, False)
         self.assertEqual(span["tx_claims"], [])
+
+    def test_outcome_claims_bind_to_authenticated_head_results(self):
+        # Outcomes commit to the ledger *before* the tail — the one the tail's
+        # signed transaction set pins — so that is the result set supplied.
+        p = proof(n=3)
+        p["outcome_claims"] = [{
+            "tx_envelope_xdr": base64.b64encode(b"V" * 8).decode(),
+            "tx_result_xdr": base64.b64encode(b"P" * 8).decode(),
+        }]
+        span = relay.build_span(p, 2, False)
+        self.assertEqual(span["tail_results_xdr"], p["closes"][1]["results_xdr_b64"])
+        self.assertEqual(len(span["outcome_claims"]), 1)
+        self.assertEqual(span["tx_claims"], [])
+
+    def test_outcome_claims_without_head_results_rejected(self):
+        p = proof(n=2)
+        for c in p["closes"]:
+            del c["results_xdr_b64"]
+        p["outcome_claims"] = [{
+            "tx_envelope_xdr": base64.b64encode(b"V" * 8).decode(),
+            "tx_result_xdr": base64.b64encode(b"P" * 8).decode(),
+        }]
+        with self.assertRaisesRegex(ValueError, "authenticated head"):
+            relay.build_span(p, 1, False)
+
+    def test_outcome_claims_on_single_header_span_rejected(self):
+        # A single-header span's head is the start header, and the fixture
+        # carries no result set for it.
+        p = proof(n=1)
+        p["outcome_claims"] = [{
+            "tx_envelope_xdr": base64.b64encode(b"V" * 8).decode(),
+            "tx_result_xdr": base64.b64encode(b"P" * 8).decode(),
+        }]
+        with self.assertRaisesRegex(ValueError, "authenticated head"):
+            relay.build_span(p, 0, False)
+
+    def test_outcome_claim_fields_are_validated(self):
+        p = proof(n=2)
+        p["outcome_claims"] = [{"tx_envelope_xdr": 1, "tx_result_xdr": "x"}]
+        with self.assertRaisesRegex(ValueError, "base64"):
+            relay.build_span(p, 1, False)
+
+    def test_outcome_claims_default_to_empty(self):
+        span = relay.build_span(proof(n=2), 1, True)
+        self.assertEqual(span["outcome_claims"], [])
+        self.assertIsNone(span["tail_results_xdr"])
 
     def test_tail_index_bounds(self):
         with self.assertRaisesRegex(ValueError, "tail-index"):

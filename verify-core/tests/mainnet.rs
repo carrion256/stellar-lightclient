@@ -161,6 +161,8 @@ fn real_mainnet_sparse_span_verifies() {
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
             claims: &[],
+            outcome_claims: &[],
+            tail_results: None,
         },
     )
     .unwrap();
@@ -190,6 +192,8 @@ fn claim_proven_against_mainnet_set() {
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
             claims,
+            outcome_claims: &[],
+            tail_results: None,
         },
     )
     .unwrap();
@@ -220,6 +224,8 @@ fn tampered_mainnet_signature_rejected() {
             tail_envelopes: &envs,
             tail_set: Some(&s.tail_set),
             claims: &[],
+            outcome_claims: &[],
+            tail_results: None,
         },
     )
     .unwrap_err();
@@ -242,6 +248,8 @@ fn wrong_network_id_rejected() {
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
             claims: &[],
+            outcome_claims: &[],
+            tail_results: None,
         },
     )
     .unwrap_err();
@@ -266,6 +274,8 @@ fn prefix_fast_path_matches_full_parse_on_mainnet() {
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
             claims: &[],
+            outcome_claims: &[],
+            tail_results: None,
         },
     )
     .unwrap();
@@ -286,6 +296,8 @@ fn prefix_fast_path_matches_full_parse_on_mainnet() {
             tail_envelopes: &envelopes,
             tail_set: Some(&s.tail_set),
             claims,
+            outcome_claims: &[],
+            tail_results: None,
         },
     )
     .unwrap();
@@ -304,6 +316,7 @@ fn journal_roundtrip_with_mainnet_ids() {
         end_hash: s.tail_hash,
         policy_digest: s.network_id,
         claim_ids: vec![TestCrypto.sha256(&s.claim_bytes)],
+        outcome_digests: Vec::new(),
     };
     assert_eq!(decode_journal(&encode_journal(&j)).unwrap(), j);
 }

@@ -726,6 +726,8 @@ fn authenticate_close(close: &Map<String, Value>, predecessor: &[u8]) -> Result<
         tail_envelopes: &envs,
         tail_set: Some(&tx_set_xdr[..]),
         claims: &claims,
+        outcome_claims: &[],
+        tail_results: None,
     };
     verify_span(&Sha256Dalek, &trust, pred_seq, sha256(predecessor), &proof)
         .map_err(|e| format!("ledger {seq}: core verification failed: {e}"))?;
