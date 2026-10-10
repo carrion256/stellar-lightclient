@@ -83,9 +83,12 @@ the `r0vm --elf` CLI proves even when no receipt output path is supplied.
   receipt claim itself and no longer accepts serialized claim bytes. It checks
   the configured image, current policy and starting checkpoint before pairing.
   Unverified evidence exposes no decoded epoch checkpoint or claim IDs.
-- `verify_receipt` remains a generic cryptographic receipt verifier. Neither
-  it nor an inclusion ID proves that a Stellar transaction succeeded or that
-  a deposit occurred. `verify_claim` is a view; it does not advance stored state.
+- `verify_receipt` verifies a RISC Zero success receipt for a caller-named
+  image and journal: the claim digest is derived on-chain and the exit code is
+  fixed to `Halted(0)`. It is not epoch-bound and proves nothing about Stellar;
+  consumers must check `image_id` themselves. Neither it nor an inclusion ID
+  proves that a Stellar transaction succeeded or that a deposit occurred.
+  `verify_claim` is a view; it does not advance stored state.
 - These are intentional state, calldata, and journal-format changes, not a
   migration shim. Existing deployments require an explicit migration or new
   deployment; old journals and old Borsh calldata are not compatible.

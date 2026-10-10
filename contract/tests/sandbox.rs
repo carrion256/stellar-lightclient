@@ -241,12 +241,21 @@ async fn e2e_sparse_span_submission_advances_the_head() -> anyhow::Result<()> {
 
     let first = f["closes"][0].clone();
     let tail = f["closes"][1].clone();
+    // Storage discipline: the head fields are fixed-size, so a submission
+    // that stores nothing grows the account by zero bytes. Any stored
+    // payload or tx-id would show up here.
+    let storage_before = contract.view_account().await?.storage_usage;
     let outcome = contract
         .call("submit_span").gas(Gas::from_tgas(300))
         .args_json(json!({ "span": span_json(&first, &tail) }))
         .transact()
         .await?;
     assert!(outcome.is_success(), "submit_span failed: {:?}", outcome.logs());
+    assert_eq!(
+        storage_before,
+        contract.view_account().await?.storage_usage,
+        "payloads are calldata only — state must not grow"
+    );
 
     // The head advances only through the authenticated predecessor — the
     // first header, pinned by the tail's signed transaction set — never to
@@ -342,8 +351,9 @@ async fn e2e_wrapper_views_are_readable_by_anyone() -> anyhow::Result<()> {
         .args_json(json!({
             "seal": b64(&[0u8; 256]),
             "control_root": b64(&[0x99u8; 32]),
-            "claim_digest": b64(&[0u8; 32]),
             "bn254_control_id": b64(&[0x22u8; 32]),
+            "image_id": b64(&[0u8; 32]),
+            "journal": b64(&[]),
         }))
         .transact()
         .await?;
@@ -362,14 +372,62 @@ async fn e2e_wrapper_views_are_readable_by_anyone() -> anyhow::Result<()> {
         .args_json(json!({
             "seal": b64(&[0u8; 256]),
             "control_root": b64(&[0x11u8; 32]),
-            "claim_digest": b64(&[0u8; 32]),
             "bn254_control_id": b64(&[0x22u8; 32]),
+            "image_id": b64(&[0u8; 32]),
+            "journal": b64(&[]),
         }))
         .transact()
         .await?;
     let evidence: Value = outcome.json()?;
     assert_eq!(evidence["verified"], json!(false));
     let _ = f;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_foreign_account_cannot_initialize() -> anyhow::Result<()> {
+    let worker = near_workspaces::sandbox().await?;
+    // `dev_deploy` (unlike deploy_light_client) does NOT call `new`: the
+    // contract sits uninitialized and `new` is callable exactly once — by
+    // itself. `#[private]` on `new` is what enforces that.
+    let contract = worker
+        .dev_deploy(&read_wasm())
+        .await
+        .expect("wasm must deploy to the sandbox");
+
+    let f = fixture();
+    let (head_seq, head_hash, network_id, trusted_nodes, threshold, epoch_image_id) =
+        client_epoch_inputs(&f);
+    let init_args = json!({
+        "owner": contract.id(),
+        "network_id": b64(&network_id),
+        "trusted_nodes": trusted_nodes.iter().map(|n| b64(n)).collect::<Vec<_>>(),
+        "threshold": threshold,
+        "max_protocol_version": 99,
+        "head_seq": head_seq,
+        "head_hash": b64(&head_hash),
+        "control_root": b64(&[0x11u8; 32]),
+        "bn254_control_id": b64(&[0x22u8; 32]),
+        "epoch_image_id": b64(&epoch_image_id),
+    });
+
+    // A foreign account cannot initialize the contract, however valid its args.
+    let foreign = worker.dev_create_account().await?;
+    let outcome = foreign
+        .call(contract.id(), "new")
+        .args_json(init_args.clone())
+        .transact()
+        .await?;
+    assert!(!outcome.is_success(), "foreign account must not initialize: {:?}", outcome.logs());
+
+    // The contract account itself can — the guard discriminates, it does not
+    // simply refuse all initialization.
+    let outcome = contract
+        .call("new")
+        .args_json(init_args)
+        .transact()
+        .await?;
+    assert!(outcome.is_success(), "self-initialization must succeed: {:?}", outcome.logs());
     Ok(())
 }
 
@@ -451,10 +509,18 @@ async fn e2e_verify_claim_reports_bad_proof_with_zeroed_epoch_fields() -> anyhow
         .transact()
         .await?;
     assert!(outcome.is_success(), "verify_claim must not panic: {:?}", outcome.logs());
+    let logs = format!("{:?}", outcome.logs());
     let evidence: Value = outcome.json()?;
     assert_eq!(evidence["verified"], json!(false), "garbage seal must not verify");
     assert_eq!(evidence["end_seq"], json!(0));
     assert!(evidence["claim_ids"].as_array().unwrap().is_empty());
+    // The journal DID bind; the proof alone failed. That is not a binding
+    // refusal, and must not be reported as one.
+    assert!(
+        !logs.contains("claim not bound"),
+        "bad proof must not log a binding mismatch: {:?}",
+        logs
+    );
     Ok(())
 }
 
@@ -481,6 +547,11 @@ async fn e2e_verify_claim_rejects_foreign_image_claim() -> anyhow::Result<()> {
         .transact()
         .await?;
     assert!(outcome.is_success(), "binding failure must not panic: {:?}", outcome.logs());
+    let logs = format!("{:?}", outcome.logs());
+    assert!(
+        logs.contains("claim not bound: image, policy, or checkpoint mismatch"),
+        "binding rejection must be distinguishable from a bad proof, got: {logs}"
+    );
     assert_eq!(outcome.json::<Value>()?["verified"], json!(false));
     Ok(())
 }
@@ -506,6 +577,11 @@ async fn e2e_verify_claim_rejects_stale_checkpoint() -> anyhow::Result<()> {
         .transact()
         .await?;
     assert!(outcome.is_success(), "binding failure must not panic: {:?}", outcome.logs());
+    let logs = format!("{:?}", outcome.logs());
+    assert!(
+        logs.contains("claim not bound: image, policy, or checkpoint mismatch"),
+        "binding rejection must be distinguishable from a bad proof, got: {logs}"
+    );
     assert_eq!(outcome.json::<Value>()?["verified"], json!(false));
     Ok(())
 }
@@ -532,6 +608,11 @@ async fn e2e_verify_claim_rejects_foreign_policy_journal() -> anyhow::Result<()>
         .transact()
         .await?;
     assert!(outcome.is_success(), "binding failure must not panic: {:?}", outcome.logs());
+    let logs = format!("{:?}", outcome.logs());
+    assert!(
+        logs.contains("claim not bound: image, policy, or checkpoint mismatch"),
+        "binding rejection must be distinguishable from a bad proof, got: {logs}"
+    );
     assert_eq!(outcome.json::<Value>()?["verified"], json!(false));
     Ok(())
 }
@@ -587,6 +668,7 @@ struct ReceiptFixture {
     control_root: [u8; 32],
     bn254_control_id: [u8; 32],
     claim_digest: [u8; 32],
+    image_id: [u8; 32],
 }
 
 /// Genuine upstream RISC Zero v3.0 Groth16 receipt fixture (source-pinned).
@@ -606,6 +688,7 @@ fn fixture_seal() -> ReceiptFixture {
         control_root: digest("control_root"),
         bn254_control_id: digest("bn254_control_id"),
         claim_digest: digest("claim_digest"),
+        image_id: digest("image_id"),
     }
 }
 
@@ -628,15 +711,18 @@ async fn e2e_genuine_risc0_seal_verifies_on_chain() -> anyhow::Result<()> {
     assert!(rotated.is_success(), "owner must pin the real wrapper: {:?}", rotated.logs());
 
     // Raw receipt from the real wrapper verifies against the real alt_bn128
-    // host functions — the pairing gate is live, not vacuous.
+    // host functions — the pairing gate is live, not vacuous. The claim
+    // digest is DERIVED on-chain: the contract's value must equal the
+    // fixture's genuine claim_digest for the stated image and journal.
     let outcome = contract
         .call("verify_receipt")
         .gas(Gas::from_tgas(300))
         .args_json(json!({
             "seal": b64(&fixture.seal),
             "control_root": b64(&fixture.control_root),
-            "claim_digest": b64(&fixture.claim_digest),
             "bn254_control_id": b64(&fixture.bn254_control_id),
+            "image_id": b64(&fixture.image_id),
+            "journal": b64(&fixture.journal),
         }))
         .transact()
         .await?;
@@ -647,22 +733,54 @@ async fn e2e_genuine_risc0_seal_verifies_on_chain() -> anyhow::Result<()> {
         json!(true),
         "genuine upstream seal must pair: {logs}"
     );
+    assert_eq!(
+        evidence["claim_digest"],
+        json!(b64(&fixture.claim_digest)),
+        "the on-chain derived claim digest must equal the genuine claim digest"
+    );
+    assert_eq!(evidence["image_id"], json!(b64(&fixture.image_id)));
 
-    // Flipping a claim-digest bit must fail.
-    let mut wrong = fixture.claim_digest;
-    wrong[0] ^= 0x01;
+    // A one-byte journal change derives a different claim: the same genuine
+    // seal cannot prove a different journal.
+    let mut wrong_journal = fixture.journal.clone();
+    wrong_journal[0] ^= 0x01;
     let outcome = contract
         .call("verify_receipt")
         .gas(Gas::from_tgas(300))
         .args_json(json!({
             "seal": b64(&fixture.seal),
             "control_root": b64(&fixture.control_root),
-            "claim_digest": b64(&wrong),
             "bn254_control_id": b64(&fixture.bn254_control_id),
+            "image_id": b64(&fixture.image_id),
+            "journal": b64(&wrong_journal),
         }))
         .transact()
         .await?;
-    assert_eq!(outcome.json::<Value>()?["verified"], json!(false));
+    assert_eq!(
+        outcome.json::<Value>()?["verified"],
+        json!(false),
+        "one-byte journal tamper must not verify"
+    );
+
+    // A different image ID derives a different claim: the same genuine seal
+    // cannot prove an execution of another program.
+    let outcome = contract
+        .call("verify_receipt")
+        .gas(Gas::from_tgas(300))
+        .args_json(json!({
+            "seal": b64(&fixture.seal),
+            "control_root": b64(&fixture.control_root),
+            "bn254_control_id": b64(&fixture.bn254_control_id),
+            "image_id": b64(&[0x77u8; 32]),
+            "journal": b64(&fixture.journal),
+        }))
+        .transact()
+        .await?;
+    assert_eq!(
+        outcome.json::<Value>()?["verified"],
+        json!(false),
+        "seal over a foreign image must not verify"
+    );
 
     // A malformed (non-canonical raw coordinate) seal must also fail: the
     // strict decoder refuses coordinate encodings above the field modulus.
@@ -674,8 +792,9 @@ async fn e2e_genuine_risc0_seal_verifies_on_chain() -> anyhow::Result<()> {
         .args_json(json!({
             "seal": b64(&malformed),
             "control_root": b64(&fixture.control_root),
-            "claim_digest": b64(&fixture.claim_digest),
             "bn254_control_id": b64(&fixture.bn254_control_id),
+            "image_id": b64(&fixture.image_id),
+            "journal": b64(&fixture.journal),
         }))
         .transact()
         .await?;
@@ -701,10 +820,16 @@ async fn e2e_genuine_risc0_seal_verifies_on_chain() -> anyhow::Result<()> {
         }))
         .transact()
         .await?;
+    let logs = format!("{:?}", outcome.logs());
     let evidence: Value = outcome.json()?;
     assert_eq!(evidence["verified"], json!(false), "a generic execution is not an epoch claim");
     assert_eq!(evidence["end_seq"], json!(0), "unverified evidence exposes no epoch fields");
     assert!(evidence["claim_ids"].as_array().unwrap().is_empty());
+    assert!(
+        logs.contains("claim not bound"),
+        "binding refusal must be distinguishable, got: {:?}",
+        logs
+    );
     Ok(())
 }
 
@@ -732,6 +857,9 @@ async fn e2e_borsh_raw_span_submission_advances_the_head() -> anyhow::Result<()>
     let mut bytes = Vec::new();
     raw.serialize(&mut bytes).expect("borsh encode");
 
+    // Same discipline on the raw path: fixed-size head fields mean a
+    // payload-free submission cannot grow state, however compact the calldata.
+    let storage_before = contract.view_account().await?.storage_usage;
     let outcome = contract
         .call("submit_span_raw")
         .gas(Gas::from_tgas(300))
@@ -739,6 +867,11 @@ async fn e2e_borsh_raw_span_submission_advances_the_head() -> anyhow::Result<()>
         .transact()
         .await?;
     assert!(outcome.is_success(), "raw submit_span failed: {:?}", outcome.logs());
+    assert_eq!(
+        storage_before,
+        contract.view_account().await?.storage_usage,
+        "raw payloads are calldata only — state must not grow"
+    );
 
     let evidence: Value = outcome.json()?;
     assert_eq!(evidence["authenticated_head"]["ledger_seq"], json!(num(&first["ledger_seq"])));

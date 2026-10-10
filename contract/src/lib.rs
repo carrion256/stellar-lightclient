@@ -146,11 +146,18 @@ pub struct TrustView {
     pub max_protocol_version: u32,
 }
 
-/// Outcome of verifying one RISC Zero Groth16 receipt.
+/// Outcome of verifying one RISC Zero Groth16 receipt for a caller-named
+/// image and journal. The claim digest is derived on-chain from the canonical
+/// `Halted(0)` success claim, so `verified: true` proves that image `image_id`
+/// halted successfully committing journal `journal` — and nothing else. This
+/// entry point is *not* epoch-bound and proves nothing about Stellar;
+/// consumers must check `image_id` themselves. [`LightClient::verify_claim`]
+/// is the epoch-bound entry point.
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 pub struct ReceiptEvidence {
     pub verified: bool,
+    pub image_id: Base64VecU8,
     pub claim_digest: Base64VecU8,
     pub control_root: Base64VecU8,
 }
@@ -215,6 +222,7 @@ pub struct LightClient {
 
 #[near]
 impl LightClient {
+    #[private]
     #[init]
     pub fn new(
         owner: AccountId,
@@ -497,7 +505,13 @@ impl LightClient {
         self.bn254_control_id = bn254_control_id;
     }
 
-    /// Verify a RISC Zero Groth16 receipt and return what it proves.
+    /// Verify a RISC Zero Groth16 receipt for a caller-named image and journal
+    /// and return what it proves.
+    ///
+    /// The claim digest is derived on-chain — callers cannot choose it — so
+    /// `verified: true` means only that image `image_id` halted successfully
+    /// (`Halted(0)`) committing exactly `journal`. This is not the epoch-bound
+    /// entry point; consumers must check `image_id` themselves.
     ///
     /// Panics only on malformed input lengths; a bad proof returns
     /// `verified: false`.
@@ -505,11 +519,11 @@ impl LightClient {
         &self,
         seal: Base64VecU8,
         control_root: Base64VecU8,
-        claim_digest: Base64VecU8,
         bn254_control_id: Base64VecU8,
+        image_id: Base64VecU8,
+        journal: Base64VecU8,
     ) -> ReceiptEvidence {
         let control_root = to32(&control_root, "control_root");
-        let claim_digest = to32(&claim_digest, "claim_digest");
         let bn254_control_id = to32(&bn254_control_id, "bn254_control_id");
         // Reject unknown wrapper builds before touching the proof. The verifying key
         // is RISC Zero's STARK→SNARK wrapper key, so the wrapper build is the trust
@@ -530,16 +544,22 @@ impl LightClient {
         let seal = seal.0;
         require!(seal.len() == 256, "seal must be 256 bytes");
 
+        // The claim is derived, never supplied: only the canonical success claim
+        // (Halted(0)) of this image over this journal can verify — the caller
+        // cannot redirect the proof to a digest of their choosing.
+        let image_id = to32(&image_id, "image_id");
+        let claim_digest =
+            verifier::claim::claim_digest(&verifier::claim::ok_claim(image_id, &journal.0));
+
         let inputs = verifier::risc0::public_inputs(control_root, claim_digest, bn254_control_id);
         let verified = match (verifier::risc0::seal_to_proof(&seal), inputs) {
-            (Ok(proof), Ok(inputs)) => {
-                verifier::groth16::verify(&verifier::risc0::verifying_key(), &proof, &inputs)
-            }
+            (Ok(proof), Ok(inputs)) => verifier::risc0::verify(&proof, &inputs),
             _ => false,
         };
 
         ReceiptEvidence {
             verified,
+            image_id: Base64VecU8(image_id.to_vec()),
             claim_digest: Base64VecU8(claim_digest.to_vec()),
             control_root: Base64VecU8(control_root.to_vec()),
         }
@@ -601,6 +621,7 @@ impl LightClient {
             claim_ids: Vec::new(),
         };
         let Some(epoch) = self.bind_epoch(&journal, claim_digest) else {
+            env::log_str("claim not bound: image, policy, or checkpoint mismatch");
             return unverified(journal);
         };
 
@@ -609,7 +630,7 @@ impl LightClient {
         let verified = match verifier::risc0::public_inputs(control_root, claim_digest, bn254_control_id) {
             Err(_) => false,
             Ok(inputs) => match verifier::risc0::seal_to_proof(&seal) {
-                Ok(proof) => verifier::groth16::verify(&verifier::risc0::verifying_key(), &proof, &inputs),
+                Ok(proof) => verifier::risc0::verify(&proof, &inputs),
                 Err(_) => false,
             },
         };

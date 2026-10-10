@@ -311,14 +311,45 @@ fn quorum_threshold_met_and_not_met() {
     assert_eq!(err, Error::QuorumNotReached { signers: 3, threshold: 4 });
 }
 
+// Deleting the dedup guard (`counted.contains`, lib.rs:408) lets the same
+// node's second vote count twice: 2 ≥ threshold 2 → Ok, and this test's
+// `unwrap_err` fails.
 #[test]
-fn untrusted_signer_skipped_and_votes_deduplicated() {
-    // Threshold 2, 1 untrusted + 2 trusted + a duplicate of the first trusted
-    // node: untrusted must neither count nor fail, duplicate counts once.
+fn duplicate_votes_count_once() {
+    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    // Two validly signed externalize statements from the same trusted node.
+    let envelopes = vec![c.envelopes[0].clone(), c.envelopes[0].clone()];
+    let err =
+        run(&c, &refs(&c.headers), &refs(&envelopes), Some(&c.tail_set), &[], 2).unwrap_err();
+    assert_eq!(err, Error::QuorumNotReached { signers: 1, threshold: 2 });
+}
+
+// Deleting the trust guard (`!trusted_nodes.contains`, lib.rs:411) lets the
+// untrusted vote count — its signature is valid for the tail slot/value, so
+// only the trust check rejects it; without the guard 2 ≥ threshold 2 → Ok and
+// this test's `unwrap_err` fails.
+#[test]
+fn untrusted_signer_does_not_count_toward_quorum() {
+    let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
+    let envelopes =
+        vec![envelope(&key(UNTRUSTED), c.tail_seq, &c.tail_value), c.envelopes[0].clone()];
+    let err =
+        run(&c, &refs(&c.headers), &refs(&envelopes), Some(&c.tail_set), &[], 2).unwrap_err();
+    assert_eq!(err, Error::QuorumNotReached { signers: 1, threshold: 2 });
+}
+
+// Positive companion: neither skip is an error — the untrusted envelope and
+// the duplicate are passed over silently and a later trusted signer still
+// reaches quorum. Not guard-discriminating by itself (with threshold 2 the
+// early break in check_quorum hides the guards); the two tests above pin
+// them.
+#[test]
+fn untrusted_and_duplicate_votes_are_skipped_without_error() {
     let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
     let mut envelopes = vec![envelope(&key(UNTRUSTED), c.tail_seq, &c.tail_value)];
-    envelopes.extend(c.envelopes.iter().take(2).cloned());
-    envelopes.push(envelopes[1].clone());
+    envelopes.push(c.envelopes[0].clone());
+    envelopes.push(c.envelopes[0].clone()); // duplicate vote of the same node
+    envelopes.push(c.envelopes[1].clone());
     let outcome =
         run(&c, &refs(&c.headers), &refs(&envelopes), Some(&c.tail_set), &[], 2).unwrap();
     assert_eq!(outcome.quorum_signers, 2);
@@ -458,6 +489,56 @@ fn prefix_fast_path_matches_full_parse() {
             vec![TestCrypto.sha256(&c.tx0), TestCrypto.sha256(&c.tx1)]
         );
     }
+}
+
+/// A two-header span re-linked onto a forged penultimate header: same
+/// ledger_seq and start link as the real one, different content (hence a
+/// different hash). The tail is re-pointed at the forgery so the chain walk
+/// still passes and the quorum envelopes still certify the tail's scp_value.
+fn forged_link_headers(c: &Chain) -> Vec<Vec<u8>> {
+    let pen = header_bytes(c.tail_seq - 1, c.start_hash, &StellarValue::default(), 19);
+    let tail = header_bytes(c.tail_seq, TestCrypto.sha256(&pen), &c.tail_value, MAX_PROTOCOL);
+    vec![pen, tail]
+}
+
+// #6 (generalized): the tail header is unsigned except its scp_value, so its
+// previous_ledger_hash is attacker-chosen; the only thing authenticating the
+// stored authenticated_head is the tail set's previousLedgerHash equaling the
+// hash of the penultimate header actually supplied. Here the honestly-signed
+// tail set pins the REAL penultimate while the chain walks over a forged one.
+// Fast-path guard: `tx_set_kind_prev` (lib.rs:481-498). Claims-path guard:
+// `prev.0 != pinned_by_set` (lib.rs:326-328). Delete either comparison and
+// this span verifies Ok — this test then fails. The error below is reachable
+// only through those two pin comparisons.
+#[test]
+fn generalized_tail_set_must_pin_the_supplied_penultimate() {
+    let c = chain(10, [5u8; 32], 12, SetKind::Generalized);
+    let headers = forged_link_headers(&c);
+    let hdrs = refs(&headers);
+    let envs = refs(&c.envelopes);
+    // Without claims: the 36-byte-prefix fast path must reject the pin.
+    let err = run(&c, &hdrs, &envs, Some(&c.tail_set), &[], 3).unwrap_err();
+    assert_eq!(err, Error::TxSetPreviousLedgerHashMismatch);
+    // With a claim: the full-parse path must reject the pin too.
+    let err = run(&c, &hdrs, &envs, Some(&c.tail_set), &[(&c.tx0, 0)], 3).unwrap_err();
+    assert_eq!(err, Error::TxSetPreviousLedgerHashMismatch);
+}
+
+// #6 (legacy): the same attack against the legacy encoding; the honest legacy
+// set pins the real penultimate, the chain supplies a forged one. Guards:
+// `tx_set_kind_prev` (lib.rs:481-498) fast path, `prev.0 != pinned_by_set`
+// (lib.rs:326-328) claims path — delete either comparison and this test
+// fails.
+#[test]
+fn legacy_tail_set_must_pin_the_supplied_penultimate() {
+    let c = chain(10, [5u8; 32], 12, SetKind::Legacy);
+    let headers = forged_link_headers(&c);
+    let hdrs = refs(&headers);
+    let envs = refs(&c.envelopes);
+    let err = run(&c, &hdrs, &envs, Some(&c.tail_set), &[], 3).unwrap_err();
+    assert_eq!(err, Error::TxSetPreviousLedgerHashMismatch);
+    let err = run(&c, &hdrs, &envs, Some(&c.tail_set), &[(&c.tx0, 0)], 3).unwrap_err();
+    assert_eq!(err, Error::TxSetPreviousLedgerHashMismatch);
 }
 
 #[test]

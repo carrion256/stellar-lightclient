@@ -9,7 +9,7 @@
 //! verification path.
 
 use bincode::Options;
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -33,7 +33,9 @@ impl Crypto for Sha256Dalek {
             return false;
         };
         let sig = Signature::from_bytes(signature);
-        key.verify_strict(message, &sig).is_ok()
+        // Non-strict: matches nearcore's host ed25519_verify, so the guest
+        // accepts exactly the same signatures as the on-chain check.
+        key.verify(message, &sig).is_ok()
     }
 }
 

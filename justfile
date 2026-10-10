@@ -88,9 +88,9 @@ test: wasm test-workspace test-guest test-relay
 test-workspace:
     cargo test --workspace
 
-# Standalone guest tests (own workspace and lockfile).
+# Guest crate tests (own workspace and lockfile, native target).
 test-guest:
-    cargo test --manifest-path guest/Cargo.toml
+    cargo test --manifest-path guest/methods/guest/Cargo.toml
 
 # Relayer unit tests.
 test-relay:

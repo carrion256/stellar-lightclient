@@ -109,6 +109,39 @@ class EncodingTests(unittest.TestCase):
         enc = relay.encode_borsh(base_span(start_header=base64.b64encode(raw).decode()))
         self.assertEqual(enc, b"\x01\x02\x00\x00\x00" + raw + b"\x00" * 8 + b"\x00\x00\x00\x00\x00")
 
+    def test_span_borsh_field_order_and_little_endian(self):
+        span = base_span(
+            start_header=base64.b64encode(b"\x11\x22").decode(),
+            headers=[
+                base64.b64encode(b"\x01\x02\x03").decode(),
+                base64.b64encode(b"\x04\x05\x06\x07\x08").decode(),
+            ],
+            tail_envelopes=[base64.b64encode(b"\x99\xaa").decode()],
+            tail_tx_set_xdr=base64.b64encode(b"\xcc\xdd\xee\xff\xaa").decode(),
+            tx_claims=[{
+                "tx_envelope_xdr": base64.b64encode(b"\x10\x20\x30").decode(),
+                "tx_index": 0x01020304,
+            }],
+        )
+        # Expected bytes hand-written from the Rust wire layout (not the
+        # encoder): SpanProofRaw { start_header: Option<Vec<u8>>,
+        # headers: Vec<Vec<u8>>, tail_envelopes: Vec<Vec<u8>>,
+        # tail_tx_set: Option<Vec<u8>>, tx_claims: Vec<TxClaimRaw> } and
+        # TxClaimRaw { tx_envelope: Vec<u8>, tx_index: u32 }.
+        expected = (
+            b"\x01\x02\x00\x00\x00\x11\x22"   # start_header Some, len 2
+            b"\x02\x00\x00\x00"               # headers: 2
+            b"\x03\x00\x00\x00\x01\x02\x03"   #   header 1, len 3
+            b"\x05\x00\x00\x00\x04\x05\x06\x07\x08"  # header 2, len 5
+            b"\x01\x00\x00\x00"               # tail_envelopes: 1
+            b"\x02\x00\x00\x00\x99\xaa"       #   envelope, len 2
+            b"\x01\x05\x00\x00\x00\xcc\xdd\xee\xff\xaa"  # tail_tx_set Some, len 5
+            b"\x01\x00\x00\x00"               # tx_claims: 1
+            b"\x03\x00\x00\x00\x10\x20\x30"   #   tx_envelope, len 3
+            b"\x04\x03\x02\x01"               #   tx_index 0x01020304, u32 LE
+        )
+        self.assertEqual(relay.encode_borsh(span), expected)
+
     def test_claim_on_single_header_without_anchor_rejected(self):
         with self.assertRaisesRegex(ValueError, "authenticated predecessor"):
             relay.build_span(proof(n=1), 0, True)

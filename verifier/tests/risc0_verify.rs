@@ -221,6 +221,45 @@ fn vk_digest_matches_risc0_reference() {
     );
 }
 
+// ------------------------------------------------ group 2b: unchecked pinned vk
+
+/// The fast-path key (`risc0::verify`) must be point-for-point the same key
+/// the checked constructor produces — this is what makes skipping the
+/// VK-side on-curve/subgroup re-validation sound.
+#[test]
+fn pinned_vk_unchecked_matches_checked() {
+    let checked = risc0::verifying_key();
+    let unchecked = risc0::pinned_vk_unchecked();
+    assert_eq!(
+        format!("{:?}", unchecked.alpha_g1),
+        format!("{:?}", checked.alpha_g1),
+        "alpha_g1 must match"
+    );
+    assert_eq!(
+        format!("{:?}", unchecked.beta_g2),
+        format!("{:?}", checked.beta_g2),
+        "beta_g2 must match"
+    );
+    assert_eq!(
+        format!("{:?}", unchecked.gamma_g2),
+        format!("{:?}", checked.gamma_g2),
+        "gamma_g2 must match"
+    );
+    assert_eq!(
+        format!("{:?}", unchecked.delta_g2),
+        format!("{:?}", checked.delta_g2),
+        "delta_g2 must match"
+    );
+    assert_eq!(unchecked.ic.len(), checked.ic.len(), "ic length must match");
+    for (i, (u, c)) in unchecked.ic.iter().zip(checked.ic.iter()).enumerate() {
+        assert_eq!(
+            format!("{:?}", u),
+            format!("{:?}", c),
+            "ic[{i}] must match"
+        );
+    }
+}
+
 // ---------------------------------------------------- group 3: seal parsing
 
 #[test]
@@ -566,6 +605,14 @@ fn genuine_risc0_receipt_verifies_and_binds_public_inputs() {
     let proof = risc0::seal_to_proof(&seal).unwrap();
     let vk = risc0::verifying_key();
     assert!(groth16::verify(&vk, &proof, &inputs));
+
+    // Fast path (shared contract): the unchecked pinned VK must agree with
+    // the checked path — true for the genuine proof, false once an input is
+    // altered (same input-binding property, checked through `risc0::verify`).
+    assert!(risc0::verify(&proof, &inputs), "fast path verifies");
+    let mut altered = inputs;
+    altered[0] += Fr::from(1u64);
+    assert!(!risc0::verify(&proof, &altered), "fast path binds inputs");
     for index in 0..inputs.len() {
         let mut altered = inputs;
         altered[index] += Fr::from(1u64);

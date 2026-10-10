@@ -11,7 +11,7 @@
 
 use base64::Engine as _;
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
-use near_sdk::test_utils::VMContextBuilder;
+use near_sdk::test_utils::{get_logs, VMContextBuilder};
 use near_sdk::testing_env;
 
 use super::*;
@@ -483,7 +483,7 @@ fn insufficient_quorum_is_rejected() {
 }
 
 #[test]
-fn claim_is_proven_and_payloads_are_not_stored() {
+fn claim_is_proven() {
     let (mut client, f) = fixture_client();
     let first = f["closes"][0].clone();
     let tail = f["closes"][1].clone();
@@ -492,18 +492,12 @@ fn claim_is_proven_and_payloads_are_not_stored() {
     // carries its own (the first header, pinned by the tail's signed set).
     let tx_id = Base64VecU8(env::sha256(b64(&tail["tx_envelope_xdr_b64"]).0.as_slice()).to_vec());
 
-    let before = env::storage_usage();
     let evidence = client.submit_span(sparse_span(&first, &tail, true, Some(claim_index)));
-    let after = env::storage_usage();
-
     assert_eq!(evidence.claimed_tx_ids.as_slice(), std::slice::from_ref(&tx_id));
-    // The span payload (headers + envelopes + tx set, hundreds of KiB) must not land in
-    // state: only the authenticated head is written.
-    let delta = u64::from(after - before);
-    assert!(delta < 256, "state grew by {delta} bytes — payloads are being stored");
     // And no transaction record is kept: proving is this contract's job,
-    // settling is the consuming application's.
-    println!("state growth for one span: {delta} bytes");
+    // settling is the consuming application's. Storage discipline (payloads are
+    // calldata only) is asserted where `state_write` actually runs — the
+    // sandbox e2e tests; the native mock never persists it.
 }
 
 
@@ -541,9 +535,11 @@ fn receipt_with_wrong_control_root_is_rejected() {
     let (client, _f) = fixture_client();
     client.verify_receipt(
         Base64VecU8(vec![0u8; 256]),
+        // control_root unpinned: rejected before image/journal are touched.
         Base64VecU8(vec![0x99; 32]),
-        Base64VecU8(vec![0u8; 32]),
         Base64VecU8(vec![0x22; 32]),
+        Base64VecU8(vec![0u8; 32]),
+        Base64VecU8(Vec::new()),
     );
 }
 
@@ -554,8 +550,10 @@ fn receipt_with_wrong_wrapper_id_is_rejected() {
     client.verify_receipt(
         Base64VecU8(vec![0u8; 256]),
         Base64VecU8(vec![0x11; 32]),
-        Base64VecU8(vec![0u8; 32]),
+        // bn254_control_id unpinned: rejected before image/journal are touched.
         Base64VecU8(vec![0x99; 32]),
+        Base64VecU8(vec![0u8; 32]),
+        Base64VecU8(Vec::new()),
     );
 }
 
@@ -794,6 +792,7 @@ fn verify_claim_reports_bad_proof_with_zeroed_epoch_fields() {
     let journal = epoch_journal(&client, 100, [0x0au8; 32], 528, [0x0bu8; 32]);
     let digest = expected_claim_digest(&client, &journal);
 
+    let logs_before = get_logs().len();
     let evidence = client.verify_claim(
         Base64VecU8(vec![0u8; 256]),
         Base64VecU8(vec![0x11; 32]),
@@ -806,6 +805,12 @@ fn verify_claim_reports_bad_proof_with_zeroed_epoch_fields() {
     assert_eq!(evidence.end_seq, 0);
     assert!(evidence.end_hash.0.is_empty());
     assert!(evidence.claim_ids.is_empty());
+    // A Groth16 failure must not masquerade as a binding failure.
+    let new_logs = &get_logs()[logs_before..];
+    assert!(
+        !new_logs.iter().any(|l| l.contains("claim not bound")),
+        "bad proof must not log a binding mismatch: {new_logs:?}"
+    );
 }
 
 #[test]
@@ -817,6 +822,7 @@ fn verify_claim_rejects_wrong_image_claim() {
     let foreign_digest =
         verifier::claim::claim_digest(&verifier::claim::ok_claim([0x77u8; 32], &journal));
 
+    let logs_before = get_logs().len();
     let evidence = client.verify_claim(
         Base64VecU8(vec![0u8; 256]),
         Base64VecU8(vec![0x11; 32]),
@@ -826,6 +832,12 @@ fn verify_claim_rejects_wrong_image_claim() {
     );
     assert!(!evidence.verified, "foreign image claims must not verify");
     assert!(evidence.claim_ids.is_empty(), "unverified evidence exposes no epoch fields");
+    // The refusal says so: binding failure is distinguishable from a bad proof.
+    let new_logs = &get_logs()[logs_before..];
+    assert!(
+        new_logs.iter().any(|l| l.contains("claim not bound: image, policy, or checkpoint mismatch")),
+        "binding failure must be logged, got: {new_logs:?}"
+    );
 }
 
 #[test]
@@ -845,6 +857,7 @@ fn verify_claim_rejects_genuine_non_epoch_receipt() {
         Base64VecU8(fixture.bn254_control_id.to_vec()),
     );
 
+    let logs_before = get_logs().len();
     let evidence = client.verify_claim(
         Base64VecU8(fixture.seal),
         Base64VecU8(fixture.control_root.to_vec()),
@@ -855,6 +868,11 @@ fn verify_claim_rejects_genuine_non_epoch_receipt() {
     assert!(!evidence.verified, "generic zkVM execution is not an epoch claim");
     assert_eq!(evidence.end_seq, 0, "unverified evidence exposes no epoch fields");
     assert!(evidence.claim_ids.is_empty());
+    let new_logs = &get_logs()[logs_before..];
+    assert!(
+        new_logs.iter().any(|l| l.contains("claim not bound: image, policy, or checkpoint mismatch")),
+        "non-epoch journal must be refused at binding, got: {new_logs:?}"
+    );
 }
 
 // ---------------------------------------- group 9: epoch image configuration

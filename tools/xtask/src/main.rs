@@ -305,10 +305,12 @@ fn fetch_checkpoint(archive: &str, checkpoint: u32) -> Result<CheckpointFiles, S
     // checkpoint (stellar-core CheckSingleLedgerHeaderWork); any other count
     // is evidence this file does not attest the checkpoint — never publish
     // from it. Transaction/result files may legitimately hold fewer records,
-    // so only the ledger file is count-checked.
-    if ledgers.len() != CHECKPOINT_LEN {
+    // so only the ledger file is count-checked. Checkpoint 63 is the one
+    // exception: its first ledger is 1 (no ledger 0), so it holds 63 records.
+    let expected = if checkpoint == 63 { 63 } else { CHECKPOINT_LEN };
+    if ledgers.len() != expected {
         return Err(format!(
-            "ledger file for checkpoint {checkpoint} has {} records, expected {CHECKPOINT_LEN}",
+            "ledger file for checkpoint {checkpoint} has {} records, expected {expected}",
             ledgers.len()
         ));
     }
@@ -373,8 +375,8 @@ fn select_pair(
     txs: &[TransactionHistoryEntry],
 ) -> Option<(u32, u32)> {
     // A claim-bearing first close needs its predecessor (seq-1) present in
-    // the checkpoint file; the file's first ledger has none. The 64 ledgers
-    // are contiguous from `ledgers[0]`, so the predecessor exists exactly
+    // the checkpoint file; the file's first ledger has none. The checkpoint's
+    // ledgers are contiguous from `ledgers[0]`, so the predecessor exists exactly
     // when this ledger is not the file's first entry.
     let min_seq = ledgers.first().map(|e| e.header.ledger_seq).unwrap_or(1);
     let tx_by_seq: BTreeMap<u32, &TransactionHistoryEntry> =

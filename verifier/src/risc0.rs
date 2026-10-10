@@ -7,7 +7,7 @@
 //! `risc0_groth16::verifying_key()` via the crate's tagged digest.
 
 use crate::bn128::{Fr, G1, G2};
-use crate::groth16::{Proof, VerifyingKey};
+use crate::groth16::{self, Proof, VerifyingKey};
 use ark_bn254::Fq;
 use ark_serialize::CanonicalDeserialize;
 
@@ -76,6 +76,18 @@ pub fn verifying_key() -> VerifyingKey {
             .map(|(x, y)| g1_from_be([x, y]).expect("pinned IC point"))
             .collect(),
     }
+}
+
+/// Groth16-verify a decoded proof against the pinned RISC Zero verifying key.
+///
+/// Equivalent to `groth16::verify(&risc0::verifying_key(), proof,
+/// public_inputs)` minus the per-call VK point re-validation: the key is a
+/// compile-time constant whose unchecked construction is asserted equal to
+/// the fully checked [`verifying_key()`] in `tests/risc0_verify.rs`, so
+/// skipping the checks saves 22 decimal parses plus the expensive G2
+/// subgroup arithmetic per receipt without changing any outcome.
+pub fn verify(proof: &Proof, public_inputs: &[Fr; 5]) -> bool {
+    groth16::verify_trusted_vk(&pinned_vk_unchecked(), proof, public_inputs)
 }
 
 /// Decode a raw 256-byte RISC Zero seal into a [`Proof`].
@@ -258,4 +270,61 @@ fn g2_from_be(ys: [[&str; 2]; 2]) -> Result<G2, String> {
         ],
     ])
     .map_err(|_| "g2 point invalid".to_string())
+}
+
+/// The pinned VK built without the on-curve/subgroup re-validation of the
+/// checked [`verifying_key()`] path.
+///
+/// Skipping the curve checks is sound because the decimal constants are fixed
+/// at compile time and `pinned_vk_unchecked_matches_checked`
+/// (tests/risc0_verify.rs) asserts this key is point-for-point identical to
+/// the fully checked one, which also proves the constants on-curve and in
+/// their subgroups. Coordinate mapping (including the G2 c0/c1 un-swap) and
+/// strict canonical field decoding are shared with the checked path.
+#[doc(hidden)]
+pub fn pinned_vk_unchecked() -> VerifyingKey {
+    VerifyingKey {
+        alpha_g1: g1_from_be_unchecked([ALPHA_X, ALPHA_Y]),
+        beta_g2: g2_from_be_unchecked([[BETA_X1, BETA_X2], [BETA_Y1, BETA_Y2]]),
+        gamma_g2: g2_from_be_unchecked([[GAMMA_X1, GAMMA_X2], [GAMMA_Y1, GAMMA_Y2]]),
+        delta_g2: g2_from_be_unchecked([[DELTA_X1, DELTA_X2], [DELTA_Y1, DELTA_Y2]]),
+        ic: [IC0_X, IC1_X, IC2_X, IC3_X, IC4_X, IC5_X]
+            .into_iter()
+            .zip([IC0_Y, IC1_Y, IC2_Y, IC3_Y, IC4_Y, IC5_Y].into_iter())
+            .map(|(x, y)| g1_from_be_unchecked([x, y]))
+            .collect(),
+    }
+}
+
+/// Strict canonical `Fq` from a pinned decimal constant (same
+/// `u256_dec_to_be32` + `fq_be_raw` path as the checked constructors, so
+/// field canonicality is still enforced). Both failures are unreachable for
+/// the pinned constants and are kept loud on purpose.
+fn fq_dec_canonical(s: &str, what: &str) -> Fq {
+    let bytes = u256_dec_to_be32(s).unwrap_or_else(|| panic!("{what} out of u256 range"));
+    fq_be_raw(&bytes).unwrap_or_else(|_| panic!("{what} is not canonical"))
+}
+
+/// `g1_from_be` minus the on-curve/subgroup/identity validation.
+fn g1_from_be_unchecked(xs: [&str; 2]) -> G1 {
+    G1::new_unchecked(
+        fq_dec_canonical(xs[0], "pinned G1 x"),
+        fq_dec_canonical(xs[1], "pinned G1 y"),
+    )
+}
+
+/// `g2_from_be` minus the validation, with the same coordinate mapping and
+/// G2 un-swap as `g2_from_be_raw`: x = Fq2(elem[0][1], elem[0][0]),
+/// y = Fq2(elem[1][1], elem[1][0]).
+fn g2_from_be_unchecked(ys: [[&str; 2]; 2]) -> G2 {
+    G2::new_unchecked(
+        ark_bn254::Fq2 {
+            c0: fq_dec_canonical(ys[0][1], "pinned G2 x.c0"),
+            c1: fq_dec_canonical(ys[0][0], "pinned G2 x.c1"),
+        },
+        ark_bn254::Fq2 {
+            c0: fq_dec_canonical(ys[1][1], "pinned G2 y.c0"),
+            c1: fq_dec_canonical(ys[1][0], "pinned G2 y.c1"),
+        },
+    )
 }
