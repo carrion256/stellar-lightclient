@@ -20,34 +20,15 @@
 //! Negation happens in arkworks *before* encoding — the encoded buffers the
 //! host sees already contain the negated coordinates (G1: negated `y`;
 //! G2: negated `y.c0`/`y.c1`, via `Neg for Affine`).
+//!
+//! The implementation lives in [`groth16_core::groth16`]; this module is the
+//! NEAR adapter over it, supplying [`NearOps`] and keeping this crate's
+//! original signatures.
 
-use crate::bn128::{self, Fr, G1, G2};
+use crate::ops::NearOps;
+use groth16_core::bn254::Fr;
 
-/// Verification key of the Groth16 proving system.
-#[derive(Debug, Clone)]
-pub struct VerifyingKey {
-    /// `[α]₁`
-    pub alpha_g1: G1,
-    /// `[β]₂`
-    pub beta_g2: G2,
-    /// `[γ]₂`
-    pub gamma_g2: G2,
-    /// `[δ]₂`
-    pub delta_g2: G2,
-    /// `IC[0] … IC[n]`: `[α]₁ + x_i·[β]₁` bindings for the public inputs.
-    pub ic: Vec<G1>,
-}
-
-/// A Groth16 proof: three curve points.
-#[derive(Debug, Clone)]
-pub struct Proof {
-    /// `A ∈ G1`
-    pub a: G1,
-    /// `B ∈ G2`
-    pub b: G2,
-    /// `C ∈ G1`
-    pub c: G1,
-}
+pub use groth16_core::groth16::{Proof, VerifyingKey};
 
 /// Verifies `proof` against `vk` and `public_inputs`.
 ///
@@ -62,33 +43,11 @@ pub struct Proof {
 /// on-curve and in the prime-order subgroup before the host is touched.
 /// Callers whose VK is already known valid (e.g. the pinned RISC Zero key)
 /// skip the VK-side re-validation with [`verify_trusted_vk`].
+///
+/// The equation and all validity guards live in [`groth16_core::groth16`];
+/// this wrapper supplies the NEAR [`NearOps`] provider.
 pub fn verify(vk: &VerifyingKey, proof: &Proof, public_inputs: &[Fr]) -> bool {
-    // VK half of the validity checks (the proof-side twin guards live in
-    // `verify_trusted_vk`): the NEAR host ABORTS on off-curve input
-    // (`AltBn128InvalidInput`), and on G1/G2 encodings that are on-curve but
-    // outside the prime-order subgroup, so no malformed point may reach
-    // `g1_multiexp`/`pairing_check`.
-    let on_curve_g1 = |p: &G1| p.is_on_curve();
-    let on_curve_g2 = |p: &G2| p.is_on_curve();
-    if !on_curve_g1(&vk.alpha_g1)
-        || !on_curve_g2(&vk.beta_g2)
-        || !on_curve_g2(&vk.gamma_g2)
-        || !on_curve_g2(&vk.delta_g2)
-        || vk.ic.iter().any(|p| !on_curve_g1(p))
-    {
-        return false;
-    }
-    let subgroup_g1 = |p: &G1| p.is_in_correct_subgroup_assuming_on_curve();
-    let subgroup_g2 = |p: &G2| p.is_in_correct_subgroup_assuming_on_curve();
-    if !subgroup_g1(&vk.alpha_g1)
-        || !subgroup_g2(&vk.beta_g2)
-        || !subgroup_g2(&vk.gamma_g2)
-        || !subgroup_g2(&vk.delta_g2)
-        || vk.ic.iter().any(|p| !subgroup_g1(p))
-    {
-        return false;
-    }
-    verify_trusted_vk(vk, proof, public_inputs)
+    groth16_core::groth16::verify(&NearOps, vk, proof, public_inputs)
 }
 
 /// [`verify`] minus the verifying-key on-curve/subgroup checks, for callers
@@ -98,57 +57,12 @@ pub fn verify(vk: &VerifyingKey, proof: &Proof, public_inputs: &[Fr]) -> bool {
 /// tests/risc0_verify.rs). Every proof-side guard of [`verify`] is kept —
 /// shape, degeneracy, on-curve, subgroup — so this path is total for any
 /// well-typed input.
+// Kept for parity with `groth16_core::groth16`; its only in-crate consumer is
+// the unit-test module below (the risc0 fast path goes through
+// `groth16_core::risc0::verify`).
+#[allow(dead_code)]
 pub(crate) fn verify_trusted_vk(vk: &VerifyingKey, proof: &Proof, public_inputs: &[Fr]) -> bool {
-    // Shape / degeneracy guards first — every branch below reaches the host.
-    if vk.ic.is_empty() || public_inputs.len() + 1 != vk.ic.len() {
-        return false;
-    }
-    // Reject identity points AND zero-coordinate points: a point with
-    // `infinity = false` but zero coordinates still encodes to 64/128 zero bytes,
-    // which the host reads as the identity and pairs trivially — an attacker-supplied
-    // degenerate proof must not pass that way. (Correction to the first draft, which
-    // only checked the infinity flag.)
-    let zero_g1 = |p: &G1| ark_ff::Zero::is_zero(&p.x) && ark_ff::Zero::is_zero(&p.y);
-    let zero_g2 = |p: &G2| ark_ff::Zero::is_zero(&p.x) && ark_ff::Zero::is_zero(&p.y);
-    if proof.a.infinity || proof.b.infinity || proof.c.infinity
-        || zero_g1(&proof.a) || zero_g2(&proof.b) || zero_g1(&proof.c)
-    {
-        return false;
-    }
-
-    // Points must be on-curve: the NEAR host ABORTS on off-curve input
-    // (`AltBn128InvalidInput`), which would turn a bad proof into a panicking
-    // transaction, while arkworks' verifier simply returns false. Check up front so
-    // `verify` is total for any well-typed input. (Correction to the first draft,
-    // which assumed only encoding errors could reach the host.)
-    let on_curve_g1 = |p: &G1| p.is_on_curve();
-    let on_curve_g2 = |p: &G2| p.is_on_curve();
-    if !on_curve_g1(&proof.a) || !on_curve_g2(&proof.b) || !on_curve_g1(&proof.c) {
-        return false;
-    }
-
-    // Points must also lie in the prime-order subgroup: the NEAR host aborts
-    // on G1/G2 encodings that are on-curve but outside it, so a raw-parsed
-    // unchecked point must never reach `pairing_check`.
-    let subgroup_g1 = |p: &G1| p.is_in_correct_subgroup_assuming_on_curve();
-    let subgroup_g2 = |p: &G2| p.is_in_correct_subgroup_assuming_on_curve();
-    if !subgroup_g1(&proof.a) || !subgroup_g2(&proof.b) || !subgroup_g1(&proof.c) {
-        return false;
-    }
-
-    // π_l = IC[0] + Σ x_i · IC[i+1] — one host multiexp call.
-    let scalars: Vec<Fr> = std::iter::once(Fr::from(1u64))
-        .chain(public_inputs.iter().copied())
-        .collect();
-    let pi_l = bn128::g1_multiexp(&vk.ic, &scalars);
-
-    // e(A,B) · e(π_l,−γ) · e(C,−δ) · e(α,−β) == 1 — one host pairing check.
-    bn128::pairing_check(&[
-        (proof.a, proof.b),
-        (pi_l, -vk.gamma_g2),
-        (proof.c, -vk.delta_g2),
-        (vk.alpha_g1, -vk.beta_g2),
-    ])
+    groth16_core::groth16::verify_trusted_vk(&NearOps, vk, proof, public_inputs)
 }
 
 
@@ -156,6 +70,7 @@ pub(crate) fn verify_trusted_vk(vk: &VerifyingKey, proof: &Proof, public_inputs:
 mod tests {
     use super::*;
     use ark_ec::AffineRepr;
+    use groth16_core::bn254::{G1, G2};
     use near_sdk::test_utils::VMContextBuilder;
     use near_sdk::testing_env;
 

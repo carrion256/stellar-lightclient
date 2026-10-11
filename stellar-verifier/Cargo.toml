@@ -1,0 +1,37 @@
+[package]
+name = "stellar-verifier"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Soroban Groth16 verifier over Stellar's native BN254 host functions"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+groth16-core = { path = "../groth16-core" }
+# no-std features: soroban-sdk 28 requires the wasm32v1-none target (no std).
+ark-bn254 = { version = "0.5", default-features = false, features = ["curve"] }
+ark-ff = { version = "0.5", default-features = false }
+# No feature flag enables BN254: it lives on the plain `env.crypto().bn254()`
+# surface (soroban-sdk 28.0.0, src/crypto.rs:201, src/crypto/bn254.rs). The
+# `hazmat-crypto` feature gates only CryptoHazmat (Poseidon etc.).
+#
+# Build the wasm with `--target wasm32v1-none`: soroban-sdk 28's build.rs
+# rejects wasm32-unknown-unknown on Rust >= 1.82 (reference-types/multi-value).
+# `alloc`: the SDK's bump-pointer global allocator for the wasm guest heap
+# (required on wasm32v1-none since groth16-core and this crate use alloc
+# Vec/String; registered only on wasm targets, inert for native tests).
+soroban-sdk = { version = "28", features = ["alloc"] }
+
+[dev-dependencies]
+# Fixture parsing mirrors the NEAR verifier's tests: ark-uncompressed points
+# straight out of testdata/groth16_fixture.json.
+ark-serialize = "0.5"
+hex = "0.4"
+serde_json = "1"
+# `testutils` gives Env::default() and the native test host, which implements
+# the BN254 host functions for real (soroban-env-host 28 depends on
+# ark-bn254/ark-ec), so tests exercise the actual host path.
+soroban-sdk = { version = "28", features = ["testutils"] }

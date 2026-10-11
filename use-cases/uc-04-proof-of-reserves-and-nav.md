@@ -73,6 +73,16 @@ balances from transaction effects. For off-chain holdings, the guest verifies th
 venue's signature over a statement and commits `venue, account_handle, asset,
 amount, as_of`.
 
+**The replay must be shown complete, or it proves a wrong balance.** Effects are
+not committed anywhere — the guest re-executes — and a receipt says only "this
+program committed this journal" (use case 07). Hand it a history truncated just
+past the deposit you want hidden and it faithfully proves a balance with that
+deposit missing, under a perfectly valid receipt. The header carries
+`bucket_list_hash`, so the reconstructed state must be tied to it: a guest that
+ends at a header whose `bucket_list_hash` matches the state it built has proven
+completeness as well as correctness. Without that binding this use case inherits
+exactly the input trap uc-07 names, and it is the one that loses money silently.
+
 ## What has to be built
 
 | work item | notes |

@@ -7,6 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+groth16-core = { path = "../groth16-core" }
 ark-bn254 = "0.5"
 ark-ec = "0.5"
 ark-ff = "0.5"

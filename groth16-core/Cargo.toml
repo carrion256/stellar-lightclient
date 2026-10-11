@@ -1,0 +1,15 @@
+[package]
+name = "groth16-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-agnostic Groth16 verification: the shared core behind the NEAR and Soroban verifiers"
+
+# no_std outside tests (see src/lib.rs); only `default-features = false` deps
+# so the crate builds for bare-wasm targets (wasm32v1-none) as well.
+[dependencies]
+ark-bn254 = { version = "0.5", default-features = false, features = ["curve"] }
+ark-ec = { version = "0.5", default-features = false }
+ark-ff = { version = "0.5", default-features = false }
+ark-serialize = { version = "0.5", default-features = false }
+sha2 = { version = "0.10", default-features = false }

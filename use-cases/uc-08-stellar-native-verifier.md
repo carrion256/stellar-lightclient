@@ -15,56 +15,88 @@ case is compliance, privacy, and trust authority *on Stellar*.
 
 ## What exists here
 
-| module | role |
+The verifier is now split so the proof system is shared and only the host
+adapter differs:
+
+| crate / module | role |
 |---|---|
-| `verifier/src/lib.rs` | layout and entry points |
-| `verifier/src/groth16.rs` | Groth16 verification over BN254 |
-| `verifier/src/risc0.rs` | RISC Zero seal handling, `public_inputs`, pinned VK |
-| `verifier/src/claim.rs` | claim digest derivation, pinned `ReceiptClaim` digest |
-| `verifier/src/bn128.rs` | BN254 primitives and wire encoding |
+| `groth16-core` | the shared core: verification equation, RISC Zero seal parsing, claim digests |
+| `groth16-core/src/ops.rs` | `ProofOps` — the entire chain seam (`sha256`, `g1_multiexp`, `pairing_check`) |
+| `groth16-core/src/groth16.rs` | the verification equation, generic over `ProofOps` |
+| `groth16-core/src/bn254.rs` | arkworks point types and buffer layout |
+| `groth16-core/src/risc0.rs`, `claim.rs` | pinned VK, seal parsing, `ReceiptClaim` digests |
+| `verifier/src/ops.rs` | NEAR provider: `alt_bn128_*` host functions, 32-byte LE encoding |
+| `stellar-verifier/src/ops.rs` | Soroban provider: `Bn254::g1_msm` / `pairing_check`, big-endian encoding |
+| `stellar-verifier/src/lib.rs` | the Stellar contract |
 
 The verified surface is small and well-defined: `verify_receipt` derives the claim
 digest on-chain and checks a 256-byte seal against a pinned wrapper identity
 (`contract/src/lib.rs:508-566`). A port only has to reproduce that.
 
-## The technical crux: pairing availability
+## The technical crux: pairing availability — resolved
 
-The implementation is explicit about where it draws the line.
-`verifier/src/bn128.rs:1` opens: *"BN254 primitives over NEAR's `alt_bn128` host
-functions."* And `verifier/src/lib.rs:3-6` states the choice outright:
+The NEAR implementation drives curve arithmetic through chain host functions
+rather than a pure-Rust pairing. `verifier/src/bn128.rs:1` opens *"BN254
+primitives over NEAR's `alt_bn128` host functions"*, and `verifier/src/lib.rs:3-6`
+states the choice outright:
 
 > This crate verifies them on NEAR by driving the curve arithmetic through the
 > chain's `alt_bn128` host functions (`env::alt_bn128_g1_multiexp`,
 > `env::alt_bn128_pairing_check`) instead of running a pure-Rust pairing
 > implementation inside the contract.
 
-**Stellar has no equivalent host function surface.** That is the entire difficulty of
-this port, and it should be said plainly in any grant document. The options:
+**Stellar exposes the same primitives natively.** CAP-0074 (Protocol 25,
+"X-Ray") added BN254 host functions to Soroban, exposed as
+`soroban_sdk::crypto::bn254::Bn254`. Protocol 25 went live on **mainnet on
+2026-01-22**, so these are deployed, not preview — a contract built on them runs
+on the live network. (The docs page still labels some examples "P25 Preview";
+that is docs status, not host-function status.)
 
-| approach | tradeoff |
-|---|---|
-| Pure-Rust BN254 pairing in the contract | no new trust assumption; likely the dominant cost of the whole verification |
-| Curve-native Groth16 on a curve Stellar supports | would need a different proving backend — not a port, a different system |
-| Verify off-chain, attest on-chain | reintroduces the trust the verifier exists to remove |
+| operation | NEAR | Soroban |
+|---|---|---|
+| multi-scalar multiplication | `env::alt_bn128_g1_multiexp` | `Bn254::g1_msm` |
+| multi-pairing product check | `env::alt_bn128_pairing_check` | `Bn254::pairing_check` |
+| SHA-256 | `env::sha256` | `crypto::sha256` |
 
-The realistic path is the first. The existing code already separates the *encoding*
-crux from the *arithmetic*: `bn128.rs` documents NEAR's 32-byte little-endian
-wire format (G1 uncompressed 64 B, G2 128 B, pairing element 192 B). A Stellar port
-replaces both the arithmetic backend and that encoding, and keeps `groth16.rs` and
-`claim.rs` logic intact.
+plus `g1_add`, `g1_mul`, `g1_is_on_curve`, and `fr_add`/`fr_sub`/`fr_mul`/
+`fr_pow`/`fr_inv`.
+
+So this is a port of the same shape, not a redesign. The one real difference is
+**wire encoding**, and it is the thing that will silently break a naive port:
+
+| | G1 | G2 |
+|---|---|---|
+| NEAR | `(x, y)`, 32-byte **little-endian** each, 64 B | `(x.c0, x.c1, y.c0, y.c1)`, 32-byte LE, 128 B |
+| Soroban | `be(X) ‖ be(Y)`, 32-byte **big-endian** each, 64 B | Ethereum-compatible — confirm coefficient order from the `Bn254G2Affine` docs |
+
+Soroban's `Bn254G1Affine` is a thin wrapper over `BytesN<64>` in
+Ethereum-compatible format: infinity is 64 zero bytes, the two flag bits
+(0x80/0x40 of the first byte) must be unset, and `from_bytes` does **not**
+validate — the host traps when an invalid point reaches a host function. A wrong
+G2 coefficient order is worse than a trap: it produces proofs that simply fail to
+verify, which reads as a bad proof rather than a bad port.
+
+The seam already exists. Groth16 verification is exactly one multiexp and one
+multi-pairing check (`verifier/src/groth16.rs:138-153`), so the chain-specific
+part is two functions and a byte encoding. Behind a provider, the whole proof
+system is shared — which is how `groth16-core` is now structured.
 
 There is a measured cost datum to start from: the test in
 `verifier/tests/risc0_verify.rs:116-120` times one Groth16 verification as a
 four-pair pairing check plus one multiexp against the real nearcore VMLogic gas
-meter. That number is the NEAR baseline to compare a Stellar implementation against.
+meter. That number is the NEAR baseline to compare a Stellar deployment against.
 
 ## Porting checklist
 
-1. BN254 field and curve arithmetic (base field, scalar field, G1, G2).
-2. Multiexp and multi-pairing check, replacing `alt_bn128_g1_multiexp` and
-   `alt_bn128_pairing_check`.
-3. Wire encoding for the Stellar contract environment, replacing NEAR's 32-byte LE
-   conventions.
+1. A `ProofOps` provider over Soroban's `Bn254`: `g1_msm` for
+   `g1_multiexp`, `pairing_check`, and `crypto::sha256`. Everything else is
+   shared from `groth16-core`.
+2. Wire encoding: arkworks affine points into Soroban's big-endian form and
+   back. G2 coefficient order must come from the SDK docs, not from the NEAR
+   layout.
+3. No BN254 arithmetic to implement — the host does the pairing. Do not port a
+   pure-Rust pairing; that was the fallback before CAP-0074, and it is now
+   strictly worse.
 4. Re-transcribe and re-pin the Groth16 verifying key and the `ReceiptClaim` digest.
    Per `AGENTS.md`, these come from the 3.0.5 verification crates and the wrapper
    identity is expected unchanged between 3.0.5 and 3.0.6 — but the definitive check
@@ -111,9 +143,12 @@ there become real:
 - **A verifier proves a receipt, not a fact.** Same rule as everywhere else in this
   set: `verified: true` means the named image halted successfully committing that
   journal. The consumer still checks `image_id` and the journal schema.
-- **Compute budget is an open question.** Pairing is expensive. Whether one
-  verification fits comfortably in a Stellar transaction is a measurement, not an
-  assumption, and it should be measured before anything downstream is promised.
+- **Compute budget is still a measurement, not an assumption.** The host does the
+  pairing now, so the cost is metered like any other host function rather than
+  being dominated by in-contract arithmetic. Whether one verification fits
+  comfortably in a Stellar transaction should be measured before anything
+  downstream is promised; `verifier/tests/risc0_verify.rs:116-120` is the NEAR
+  baseline to compare against.
 - **Do not claim confidential transactions from this.** This is a verifier. Amount
   privacy is a separate construction, and the standard for permissioned finance
   referred to as "3613" in the discussion needs its exact CAP number confirmed

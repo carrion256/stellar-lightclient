@@ -37,6 +37,8 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
 | workspace tests, including NEAR sandbox | `cargo test --workspace` |
 | standalone guest tests | `cargo test --manifest-path guest/methods/guest/Cargo.toml` |
 | relayer tests | `python3 -m unittest discover -s tools -p test_relay.py` |
+| NEAR contract wasm | `cargo build -p stellar-light-client --release --target wasm32-unknown-unknown` |
+| Soroban contract wasm | `stellar contract build --manifest-path stellar-verifier/Cargo.toml` |
 | zkVM guest toolchain | `risc0-setup` |
 | build guest program (does not prove a receipt) | `cargo risczero build --manifest-path guest/Cargo.toml --features zkvm-entrypoint` |
 | fetch and authenticate a fixture | `cargo run -p xtask -- fetch-fixture --checkpoint 64822015 --out /tmp/stellar-fixture.json` |
@@ -46,6 +48,29 @@ Build the wasm **before** `cargo test`: sandbox e2e deploys that artifact.
 Its freshness guard checks contract, verifier, and verify-core sources and
 manifests, plus the root manifest and lockfile. The guest has a separate
 workspace and lockfile, so its tests must also be run explicitly.
+
+## Building the Soroban contract
+
+`stellar-verifier` is a Soroban contract and does **not** build with plain
+`cargo build`. Three things bite, in the order you will hit them:
+
+1. `soroban-sdk` v28 requires `stellar-cli` **v25.2.0+** and rejects `cargo
+   build` outright ("use `stellar contract build`"). The CLI lives at
+   `~/.cargo/bin/stellar` and is **not on `PATH`** in the nix shell — export
+   `$HOME/.cargo/bin` first. Version here is 26.1.0.
+2. The target is **`wasm32v1-none`**, not `wasm32-unknown-unknown`. Rust 1.82+
+   enables `reference-types`/`multi-value` on `wasm32-unknown-unknown`, which
+   the Soroban Environment rejects. `wasm32v1-none` is a `no_std` target, so
+   anything linked into a contract must be `no_std`-clean.
+3. `stellar contract build` refuses a release profile without
+   `overflow-checks = true`. The workspace profile sets it; do not remove it.
+
+`groth16-core` is the shared, chain-agnostic Groth16 core behind both verifiers.
+It must stay `no_std`-clean and must never depend on `near-sdk` or
+`soroban-sdk` — the chain seam is the three-method `ProofOps` trait
+(`sha256`, `g1_multiexp`, `pairing_check`). Each chain supplies a provider and
+owns its own point encoding: NEAR uses 32-byte little-endian coordinates,
+Soroban uses Ethereum-compatible big-endian.
 
 The Docker guest builder needs network access to crates.io. For a locally
 installed `risc0` toolchain, the Nix shell's `rustc` must not shadow that
