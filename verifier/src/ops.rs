@@ -139,4 +139,33 @@ mod tests {
         assert!(NearOps.pairing_check(&[(g1, g2), (g1, -g2)]));
         assert!(!NearOps.pairing_check(&[(g1, g2)]));
     }
+
+    /// The third `ProofOps` obligation, pinned to an external constant.
+    ///
+    /// `sha256` feeds `claim_digest`, which becomes a Groth16 public input, so
+    /// a non-standard digest here would silently verify receipts against the
+    /// wrong claim rather than fail. Soroban's provider carries the same NIST
+    /// vector; pinning NEAR's against the same constant *and* against the
+    /// reference implementation means all three cannot drift apart without one
+    /// of these failing.
+    #[test]
+    fn sha256_matches_the_nist_vector_and_the_reference() {
+        testing_env!(VMContextBuilder::new().build());
+        // NIST FIPS 180-2 / NESSIE test vector for "abc".
+        let expected = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(
+            NearOps.sha256(b"abc"),
+            expected,
+            "NEAR's host sha256 must be standard SHA-256"
+        );
+        assert_eq!(
+            groth16_core::bn254::NativeOps.sha256(b"abc"),
+            expected,
+            "and the arkworks reference must agree with it"
+        );
+    }
 }
