@@ -9,7 +9,9 @@
 //! # Layout
 //!
 //! - [`ops`] — the [`ProofOps`] trait: the whole chain seam.
-//! - [`bn254`] — BN254 affine types and the wire encoding.
+//! - [`bn254`] — arkworks point types and a pure-Rust [`ProofOps`] reference.
+//!   Wire encoding is deliberately *not* here: each chain's byte order belongs
+//!   to that chain's provider.
 //! - [`groth16`] — the verification equation over [`ProofOps`].
 //! - [`claim`] — RISC Zero `ReceiptClaim` digest derivation.
 //! - [`risc0`] — the pinned RISC Zero verifying key and seal parsing.

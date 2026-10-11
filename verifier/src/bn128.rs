@@ -15,15 +15,97 @@
 //!   wrong buffer length) **abort** the host call — the contract traps, it
 //!   does not receive `false`.
 //!
-//! The arkworks types and the little-endian encoding itself live in
-//! [`groth16_core::bn254`]; the host calls live in [`NearOps`]
-//! ([`crate::ops`]). This module keeps this crate's original surface: the
-//! point aliases plus the two free host operations.
+//! This wire layout is **NEAR's**, and lives here rather than in
+//! `groth16-core` for that reason: the shared core is chain-agnostic and must
+//! not know any chain's byte order. Soroban uses Ethereum-compatible
+//! big-endian with the G2 coefficients swapped, and owns its own codec in
+//! `stellar-verifier/src/ops.rs`. The arkworks point types themselves are
+//! shared ([`groth16_core::bn254`]); only the encoding differs.
 
 use crate::ops::NearOps;
+use ark_bn254::Fq;
+use ark_ff::{BigInt, PrimeField};
 use groth16_core::ProofOps;
 
 pub use groth16_core::bn254::{Fr, G1, G2};
+
+pub const SCALAR_SIZE: usize = 32;
+pub const G1_SIZE: usize = 2 * SCALAR_SIZE;
+pub const G2_SIZE: usize = 4 * SCALAR_SIZE;
+pub const G1_MULTIEXP_ELEMENT_SIZE: usize = G1_SIZE + SCALAR_SIZE; // 96
+pub const PAIRING_CHECK_ELEMENT_SIZE: usize = G1_SIZE + G2_SIZE; // 192
+
+/// Encode a base-field element as 32-byte little-endian, exactly the
+/// `decode_u256` format (`u128::from_le_bytes` on the lo/hi halves) the host
+/// parser uses.
+pub fn fq_to_le(x: &Fq) -> [u8; SCALAR_SIZE] {
+    let limbs = x.into_bigint().0; // [u64; 4], canonical representative
+    let mut out = [0u8; SCALAR_SIZE];
+    for (i, limb) in limbs.iter().enumerate() {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    out
+}
+
+/// Encode a scalar-field element as 32-byte little-endian.
+pub fn fr_to_le(x: &Fr) -> [u8; SCALAR_SIZE] {
+    let limbs = x.into_bigint().0;
+    let mut out = [0u8; SCALAR_SIZE];
+    for (i, limb) in limbs.iter().enumerate() {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    out
+}
+
+/// Decode a 32-byte little-endian base-field element produced by
+/// [`fq_to_le`]. The host only ever emits canonical values (`into_bigint`
+/// of a valid field element is below the modulus), so the `None` arm is
+/// unreachable; fall back to zero rather than panic.
+pub fn fq_from_le(b: &[u8]) -> Fq {
+    assert!(b.len() >= SCALAR_SIZE);
+    let mut limbs = [0u64; 4];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let mut chunk = [0u8; 8];
+        chunk.copy_from_slice(&b[i * 8..(i + 1) * 8]);
+        *limb = u64::from_le_bytes(chunk);
+    }
+    Fq::from_bigint(BigInt(limbs)).unwrap_or_default()
+}
+
+/// Encode `p` as `(x, y)`, 64 B, each 32-byte LE. The identity (or the
+/// host-encoded all-zero buffer) becomes 64 zero bytes, which the host
+/// decodes back to the identity per `decode_g1`.
+pub fn g1_to_bytes(p: &G1) -> [u8; G1_SIZE] {
+    let mut out = [0u8; G1_SIZE];
+    out[..SCALAR_SIZE].copy_from_slice(&fq_to_le(&p.x));
+    out[SCALAR_SIZE..].copy_from_slice(&fq_to_le(&p.y));
+    out
+}
+
+/// Decode a 64-byte G1 buffer. All-zero input decodes to the identity,
+/// matching the host's `decode_g1` convention.
+pub fn g1_from_bytes(b: &[u8]) -> G1 {
+    assert!(b.len() == G1_SIZE);
+    if b.iter().all(|&byte| byte == 0) {
+        return G1::identity();
+    }
+    G1::new_unchecked(
+        fq_from_le(&b[..SCALAR_SIZE]),
+        fq_from_le(&b[SCALAR_SIZE..G1_SIZE]),
+    )
+}
+
+/// Encode `p` as `(x.c0, x.c1, y.c0, y.c1)`, 128 B, each 32-byte LE — the
+/// host `decode_g2`/`decode_fq2` layout (real then imaginary coefficient,
+/// no EVM-style coordinate swapping).
+pub fn g2_to_bytes(p: &G2) -> [u8; G2_SIZE] {
+    let mut out = [0u8; G2_SIZE];
+    out[..SCALAR_SIZE].copy_from_slice(&fq_to_le(&p.x.c0));
+    out[SCALAR_SIZE..2 * SCALAR_SIZE].copy_from_slice(&fq_to_le(&p.x.c1));
+    out[2 * SCALAR_SIZE..3 * SCALAR_SIZE].copy_from_slice(&fq_to_le(&p.y.c0));
+    out[3 * SCALAR_SIZE..].copy_from_slice(&fq_to_le(&p.y.c1));
+    out
+}
 
 /// Weighted G1 sum `Σ scalars[i] · points[i]`, computed by NEAR's
 /// `alt_bn128_g1_multiexp` host function.
@@ -54,10 +136,6 @@ pub fn pairing_check(pairs: &[(G1, G2)]) -> bool {
 mod tests {
     use super::*;
     use ark_bn254::Fq;
-    use groth16_core::bn254::{
-        fq_from_le, fq_to_le, g1_from_bytes, g1_to_bytes, g2_to_bytes, G1_MULTIEXP_ELEMENT_SIZE,
-        G1_SIZE, G2_SIZE, PAIRING_CHECK_ELEMENT_SIZE,
-    };
 
     #[test]
     fn fq_roundtrip_and_le_layout() {

@@ -8,7 +8,7 @@
 //! the host (identity / `true`), and the host's multiexp result is decoded as
 //! strictly 64 bytes.
 
-use groth16_core::bn254::{
+use crate::bn128::{
     fr_to_le, g1_from_bytes, g1_to_bytes, g2_to_bytes, Fr, G1, G2,
     G1_MULTIEXP_ELEMENT_SIZE, PAIRING_CHECK_ELEMENT_SIZE,
 };
