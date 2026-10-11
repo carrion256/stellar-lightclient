@@ -169,6 +169,109 @@ fn host_msm_matches_arkworks() {
     assert_eq!(host, expected);
 }
 
+/// Cross-backend verdict equivalence — the test that catches a provider whose
+/// *encoding* is wrong while every per-backend suite still passes.
+///
+/// The same logical proof is verified twice: once through the contract's full
+/// wire path (decode big-endian bytes → Soroban host `g1_msm`/`pairing_check`),
+/// once through the pure-arkworks `NativeOps` reference. They must agree on
+/// every case, positive and negative. A wrong G2 coefficient order
+/// (`x.c1||x.c0||y.c1||y.c0` vs NEAR's `x.c0||x.c1||y.c0||y.c1`) is exactly the
+/// bug this catches: the host call succeeds and simply fails to verify, which
+/// reads as a bad proof rather than a bad port. Neither backend's own suite
+/// finds it, because each is internally consistent.
+#[test]
+fn wire_path_and_native_reference_agree_on_every_verdict() {
+    let f = groth16_fixture();
+    let vk_wire = wire_vk(&f);
+    let proof_wire = wire_proof(&f["proof"]);
+    let inputs_wire = wire_inputs(&f["public_inputs"]);
+
+    let vk = groth16_core::VerifyingKey {
+        alpha_g1: g1_of(&f["vk"]["alpha_g1"]),
+        beta_g2: g2_of(&f["vk"]["beta_g2"]),
+        gamma_g2: g2_of(&f["vk"]["gamma_g2"]),
+        delta_g2: g2_of(&f["vk"]["delta_g2"]),
+        ic: f["vk"]["gamma_abc_g1"]
+            .as_array()
+            .expect("ic list")
+            .iter()
+            .map(|p| g1_of(p))
+            .collect(),
+    };
+    let proof = groth16_core::Proof {
+        a: g1_of(&f["proof"]["a"]),
+        b: g2_of(&f["proof"]["b"]),
+        c: g1_of(&f["proof"]["c"]),
+    };
+    let inputs: Vec<Fr> = f["public_inputs"]
+        .as_array()
+        .expect("public inputs list")
+        .iter()
+        .map(|x| parse_fr(&hex_bytes(x)))
+        .collect();
+
+    // Cases must be well-formed on *both* paths. A bit-flipped proof is
+    // off-curve and cannot be represented as an arkworks point at all, so it
+    // cannot be a cross-backend case — that one belongs to
+    // `tampered_wire_proof_returns_false_without_trapping`, which covers the
+    // host-side trap guard. Here we want inputs where both backends can
+    // compute a verdict and must reach the *same* one.
+    let mut bad_inputs: Vec<Fr> = inputs.clone();
+    bad_inputs[0] += Fr::from(1u64);
+    let bad_inputs_wire: Vec<u8> = bad_inputs
+        .iter()
+        .flat_map(|x| fr_to_wire(x).to_vec())
+        .collect();
+
+    // A well-formed but wrong verifying key: swap one IC point for alpha. The
+    // host path must see the corrupted bytes too, so patch the wire at the
+    // documented offset — `alpha_g1(64) || beta_g2(128) || gamma_g2(128) ||
+    // delta_g2(128) || ic[]`, hence ic[1] begins at 448 + 64.
+    let mut bad_vk = vk.clone();
+    bad_vk.ic[1] = vk.alpha_g1;
+    let mut bad_vk_wire = vk_wire.clone();
+    let ic1_at = 448 + 64;
+    bad_vk_wire[ic1_at..ic1_at + 64].copy_from_slice(&g1_to_wire(&vk.alpha_g1));
+
+    let cases: Vec<(
+        &str,
+        &Vec<u8>,                    // vk wire for the host path
+        &groth16_core::VerifyingKey, // vk for the native path
+        &[u8],                       // inputs wire for the host path
+        &[Fr],                       // inputs for the native path
+    )> = vec![
+        ("valid", &vk_wire, &vk, &inputs_wire, &inputs),
+        (
+            "wrong public input",
+            &vk_wire,
+            &vk,
+            &bad_inputs_wire,
+            &bad_inputs,
+        ),
+        (
+            "corrupted verifying key",
+            &bad_vk_wire,
+            &bad_vk,
+            &inputs_wire,
+            &inputs,
+        ),
+    ];
+
+    for (name, vk_w, vk_c, in_w, native_inputs) in cases {
+        let env = Env::default();
+        let via_host = call_verify(&env, vk_w, &proof_wire, in_w);
+        let via_native = groth16_core::groth16::verify(&NativeOps, vk_c, &proof, native_inputs);
+        assert_eq!(
+            via_host, via_native,
+            "wire path and native reference disagree on case: {name}"
+        );
+    }
+    // And pin that the positive case really is positive, so agreement is not
+    // two backends both returning false.
+    assert!(call_verify(&Env::default(), &vk_wire, &proof_wire, &inputs_wire));
+}
+
 /// A single flipped bit in a proof coordinate (off-curve) must come back
 /// `false` from the entry point — not trap. This is the guard that keeps
 /// the Soroban host from aborting on a malformed point.

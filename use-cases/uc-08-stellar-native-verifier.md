@@ -45,12 +45,29 @@ states the choice outright:
 > `env::alt_bn128_pairing_check`) instead of running a pure-Rust pairing
 > implementation inside the contract.
 
-**Stellar exposes the same primitives natively.** CAP-0074 (Protocol 25,
-"X-Ray") added BN254 host functions to Soroban, exposed as
-`soroban_sdk::crypto::bn254::Bn254`. Protocol 25 went live on **mainnet on
-2026-01-22**, so these are deployed, not preview — a contract built on them runs
-on the live network. (The docs page still labels some examples "P25 Preview";
-that is docs status, not host-function status.)
+**Stellar exposes the same primitives natively, across two CAPs.** This matters
+because the provider leans on the later one:
+
+| host function | CAP | min protocol | mainnet since |
+|---|---|---|---|
+| `bn254_g1_add`, `bn254_g1_mul`, `bn254_multi_pairing_check` | CAP-0074 | 25 | 2026-01-22 (X-Ray) |
+| `bn254_g1_msm`, `bn254_g1_is_on_curve`, `bn254_fr_*` | CAP-0080 | **26** | 2026-05-06 (Yardstick) |
+
+Both are live, so the contract is deployable today. But note precisely what it
+needs: **the Soroban provider uses `g1_msm`, which is Protocol 26.** A
+Protocol-25-only deployment would have to express the multiexp as
+`g1_mul` + `g1_add` per element — more host calls, same result. Do not
+characterise the whole surface as "CAP-0074" without that caveat.
+
+Two details from CAP-0074 worth carrying: G1 serialises as
+`concat(be_bytes(X), be_bytes(Y))` — confirming the big-endian encoding — and
+*"This function does NOT perform subgroup check on the inputs."* That last line
+is why the shared core's on-curve and prime-order-subgroup checks are
+load-bearing rather than defensive: the host will happily accept a point
+outside the subgroup.
+
+(Stellar's docs page still labels some examples "P25 Preview"; that is docs
+status, not host-function status.)
 
 | operation | NEAR | Soroban |
 |---|---|---|

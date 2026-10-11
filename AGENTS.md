@@ -14,7 +14,8 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
 
 ## Shell guarantees
 
-- Rust (stable) with the `wasm32-unknown-unknown` target preinstalled.
+- Rust (stable) with the `wasm32-unknown-unknown` and `wasm32v1-none` targets
+  preinstalled (the latter for Soroban contracts).
 - `cargo-risczero` **3.0.6** (with `r0vm`), from nix. The pinned Groth16
   verifying key in `verifier/src/risc0.rs` and the `ReceiptClaim` digest in
   `verifier/src/claim.rs` come from the **3.0.5** verification crates
@@ -61,7 +62,10 @@ workspace and lockfile, so its tests must also be run explicitly.
 2. The target is **`wasm32v1-none`**, not `wasm32-unknown-unknown`. Rust 1.82+
    enables `reference-types`/`multi-value` on `wasm32-unknown-unknown`, which
    the Soroban Environment rejects. `wasm32v1-none` is a `no_std` target, so
-   anything linked into a contract must be `no_std`-clean.
+   anything linked into a contract must be `no_std`-clean. It is provisioned by
+   `devenv.nix`; outside the shell you need
+   `rustup target add wasm32v1-none` first or the build dies with
+   `can't find crate for core` before reaching any of your code.
 3. `stellar contract build` refuses a release profile without
    `overflow-checks = true`. The workspace profile sets it; do not remove it.
 

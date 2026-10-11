@@ -33,13 +33,18 @@ pub trait ProofOps {
 
     /// Multi-scalar multiplication in G1: `Σ points[i] · scalars[i]`.
     ///
-    /// `points.len()` must equal `scalars.len()`. An empty slice must return the
-    /// identity without touching the host.
+    /// `points.len()` must equal `scalars.len()`. Providers must normalize the
+    /// empty case to the identity **before** touching the host — not every host
+    /// accepts an empty buffer, so this is a requirement on the provider, not
+    /// something the host does for you.
     fn g1_multiexp(&self, points: &[G1], scalars: &[Fr]) -> G1;
 
     /// Multi-pairing product check: `∏ e(pairs[i].0, pairs[i].1) == 1`.
     ///
-    /// An empty slice is the empty product, which is the identity, and must
-    /// return `true` without touching the host.
+    /// Providers must normalize the empty case to `true` before touching the
+    /// host: Soroban's `Bn254::pairing_check` *panics* on an empty or mismatched
+    /// vector while NEAR's returns `true`, so the shared core cannot rely on the
+    /// host for this. `groth16_core::groth16::verify` never calls this with an
+    /// empty or mismatched slice.
     fn pairing_check(&self, pairs: &[(G1, G2)]) -> bool;
 }

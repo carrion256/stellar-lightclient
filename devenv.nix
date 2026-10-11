@@ -4,7 +4,7 @@
   languages.rust = {
     enable = true;
     channel = "stable";
-    targets = [ "wasm32-unknown-unknown" ];
+    targets = [ "wasm32-unknown-unknown" "wasm32v1-none" ];
   };
 
   packages = with pkgs; [
