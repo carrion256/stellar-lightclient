@@ -167,6 +167,7 @@ pub fn verify_trusted_vk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_bn254::{Fq, Fq2};
     use ark_ec::AffineRepr;
     use crate::bn254::NativeOps;
 
@@ -178,6 +179,47 @@ mod tests {
     /// `[k]G2` — same, on the twist.
     fn g2_mul(k: Fr) -> G2 {
         (G2::generator() * k).into()
+    }
+
+    /// Degenerate points that are *not* flagged infinite but carry zero
+    /// coordinates. On the wire these encode to the same all-zero buffer the
+    /// host decodes as the identity, so a degenerate proof must not pass by
+    /// pairing trivially — `verifier::bn128` pins that wire-level fact.
+    ///
+    /// This overlaps `off_curve_proof_points_are_rejected`: `(0, 0)` is not on
+    /// the BN254 curve either, so that check catches it today. What is pinned
+    /// here is the *observable*, not the mechanism — degenerate points are
+    /// rejected — so the property survives a reorder or a refactor of which
+    /// guard fires. It will not fail if only one of the two guards is removed;
+    /// it fails if the property is lost.
+    #[test]
+    fn zero_coordinate_proof_points_are_rejected() {
+        let zero_g1 = G1::new_unchecked(Fq::from(0u64), Fq::from(0u64));
+        let zero_g2 = G2::new_unchecked(
+            Fq2::new(Fq::from(0u64), Fq::from(0u64)),
+            Fq2::new(Fq::from(0u64), Fq::from(0u64)),
+        );
+        assert!(!zero_g1.infinity, "the degenerate case is a non-infinity point");
+
+        let (vk, mut proof, inputs) = satisfying();
+        proof.a = zero_g1;
+        proof.c = g1_mul(-Fr::from(2u64));
+        assert!(!verify(&NativeOps, &vk, &proof, &inputs), "zero-coordinate A rejected");
+
+        let (vk, mut proof, inputs) = satisfying();
+        proof.b = zero_g2;
+        proof.c = g1_mul(-Fr::from(2u64));
+        assert!(!verify(&NativeOps, &vk, &proof, &inputs), "zero-coordinate B rejected");
+
+        let (vk, mut proof, mut inputs) = satisfying();
+        proof.c = zero_g1;
+        inputs[0] = -Fr::from(1u64);
+        assert!(!verify(&NativeOps, &vk, &proof, &inputs), "zero-coordinate C rejected");
+
+        // The verifying-key side is covered by the same guard.
+        let (mut vk, proof, inputs) = satisfying();
+        vk.alpha_g1 = zero_g1;
+        assert!(!verify(&NativeOps, &vk, &proof, &inputs), "zero-coordinate VK point rejected");
     }
 
     /// A VK whose points are all `[1]` multiples of the generators.

@@ -197,4 +197,42 @@ mod tests {
         assert_eq!(G1_MULTIEXP_ELEMENT_SIZE, 96);
         assert_eq!(PAIRING_CHECK_ELEMENT_SIZE, 192);
     }
+
+    /// The threat `groth16_core::groth16`'s zero-coordinate degeneracy guard
+    /// exists for. A point with `infinity = false` but zero coordinates
+    /// encodes to the *same* all-zero buffer as the identity — and decoding
+    /// that buffer yields a genuine identity. On the wire the two are
+    /// indistinguishable, so anything that lets such a point reach the host has
+    /// accepted a proof that pairs trivially and verifies for the wrong reason.
+    ///
+    /// This is the evidence; the rejection behaviour is pinned in
+    /// `groth16_core::groth16::tests`.
+    #[test]
+    fn zero_coordinate_point_is_wire_indistinguishable_from_identity() {
+        let zero = G1::new_unchecked(Fq::from(0u64), Fq::from(0u64));
+        assert!(!zero.infinity, "the degenerate case is not flagged infinite");
+        assert_eq!(g1_to_bytes(&zero), [0u8; G1_SIZE], "encodes all-zero");
+        assert_eq!(
+            g1_to_bytes(&zero),
+            g1_to_bytes(&G1::identity()),
+            "byte-identical to the identity"
+        );
+        assert!(
+            g1_from_bytes(&g1_to_bytes(&zero)).infinity,
+            "round-trips to a real identity — the trivially-pairing case"
+        );
+
+        let zero_g2 = G2::new_unchecked(
+            ark_bn254::Fq2 {
+                c0: Fq::from(0u64),
+                c1: Fq::from(0u64),
+            },
+            ark_bn254::Fq2 {
+                c0: Fq::from(0u64),
+                c1: Fq::from(0u64),
+            },
+        );
+        assert!(!zero_g2.infinity);
+        assert_eq!(g2_to_bytes(&zero_g2), [0u8; G2_SIZE]);
+    }
 }
