@@ -76,18 +76,13 @@ fn parse_g1_maybe_tampered(raw: &[u8]) -> G1 {
     )
 }
 
-// ------------------------------------------------------------ group 1: math
-
-#[test]
-fn math_matches_arkworks_fixture() {
-    // `groth16::verify` hits near_sdk host functions; they need a mocked chain.
-    testing_env!(VMContextBuilder::new().build());
+/// The toy Groth16 fixture decoded into the shared core's structured types.
+/// The math test and the cross-backend equivalence test both need exactly this.
+fn structured_fixture() -> (VerifyingKey, Proof, Vec<Fr>) {
     let f = fixture();
-
     let g1 = |v: &Value| parse_g1(&hex_bytes(v));
     let g2 = |v: &Value| parse_g2(&hex_bytes(v));
     let fr = |v: &Value| parse_fr(&hex_bytes(v));
-
     let vk = VerifyingKey {
         alpha_g1: g1(&f["vk"]["alpha_g1"]),
         beta_g2: g2(&f["vk"]["beta_g2"]),
@@ -100,18 +95,32 @@ fn math_matches_arkworks_fixture() {
             .map(g1)
             .collect(),
     };
-    let proof_of = |p: &Value| Proof {
-        a: g1(&p["a"]),
-        b: g2(&p["b"]),
-        c: g1(&p["c"]),
+    let proof = Proof {
+        a: g1(&f["proof"]["a"]),
+        b: g2(&f["proof"]["b"]),
+        c: g1(&f["proof"]["c"]),
     };
-    let proof = proof_of(&f["proof"]);
     let inputs: Vec<Fr> = f["public_inputs"]
         .as_array()
         .expect("public_inputs array")
         .iter()
         .map(fr)
         .collect();
+    (vk, proof, inputs)
+}
+
+// ------------------------------------------------------------ group 1: math
+
+#[test]
+fn math_matches_arkworks_fixture() {
+    // `groth16::verify` hits near_sdk host functions; they need a mocked chain.
+    testing_env!(VMContextBuilder::new().build());
+    let f = fixture();
+    let (vk, proof, inputs) = structured_fixture();
+
+    let g1 = |v: &Value| parse_g1(&hex_bytes(v));
+    let g2 = |v: &Value| parse_g2(&hex_bytes(v));
+    let fr = |v: &Value| parse_fr(&hex_bytes(v));
 
     // One Groth16 verification = 4-pair pairing check + one multiexp. Measure the
     // real host-gas cost: the near mock delegates alt_bn128_* to nearcore VMLogic,
@@ -621,4 +630,62 @@ fn genuine_risc0_receipt_verifies_and_binds_public_inputs() {
     let mut malformed = seal;
     malformed[32] |= 0x80;
     assert!(risc0::seal_to_proof(&malformed).is_err());
+}
+
+// ------------------------------------------------- cross-backend equivalence
+
+/// The NEAR provider and the pure-arkworks reference must reach identical
+/// verdicts on identical input.
+///
+/// `verifier/src/groth16.rs` and `groth16-core/src/groth16.rs` carry parallel
+/// suites, but agreement between two suites is not agreement between two
+/// backends on one case. This is the direct comparison: the same VK, proof and
+/// public inputs through `NearOps` (driving `alt_bn128_*` via nearcore VMLogic)
+/// and through `NativeOps` (arkworks, no host). The Soroban side has the
+/// equivalent test against the same reference.
+///
+/// Each case carries its expected verdict, so agreement alone cannot pass: two
+/// backends that both wrongly accept a negative would satisfy `==`. Cases are
+/// well-formed on both paths — a bit-flipped coordinate is off-curve and cannot
+/// be an arkworks point at all, which is `math_matches_arkworks_fixture`'s
+/// tampered-proof case rather than a cross-backend one.
+#[test]
+fn near_and_native_backends_agree_on_every_verdict() {
+    testing_env!(VMContextBuilder::new().build());
+    let (vk, proof, inputs) = structured_fixture();
+
+    // Swapped A and C: well-formed, wrong.
+    let swapped = Proof {
+        a: proof.c,
+        b: proof.b,
+        c: proof.a,
+    };
+    // Degenerate: non-infinity but zero coordinates, which encodes
+    // identically to the identity (see `bn128`'s wire test).
+    let zero_a = Proof {
+        a: G1::new_unchecked(Fq::from(0u64), Fq::from(0u64)),
+        b: proof.b,
+        c: proof.c,
+    };
+    let mut bad_inputs = inputs.clone();
+    bad_inputs[0] += Fr::from(1u64);
+
+    let cases: Vec<(&str, bool, &Proof, &Vec<Fr>)> = vec![
+        ("valid", true, &proof, &inputs),
+        ("wrong public input", false, &proof, &bad_inputs),
+        ("swapped A and C", false, &swapped, &inputs),
+        ("zero-coordinate A", false, &zero_a, &inputs),
+    ];
+
+    for (name, expected, case_proof, case_inputs) in cases {
+        let via_near = groth16::verify(&vk, case_proof, case_inputs);
+        let via_native =
+            groth16_core::groth16::verify(&groth16_core::bn254::NativeOps, &vk, case_proof, case_inputs);
+        assert_eq!(via_near, expected, "NEAR path got the wrong verdict for case: {name}");
+        assert_eq!(via_native, expected, "native path got the wrong verdict for case: {name}");
+        assert_eq!(
+            via_near, via_native,
+            "NEAR and native backends disagree on case: {name}"
+        );
+    }
 }
