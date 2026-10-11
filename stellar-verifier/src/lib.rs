@@ -162,9 +162,17 @@ impl StellarVerifier {
     ///   (`a (64) || b (128) || c (64)`, big-endian), byte-for-byte the
     ///   fixture's `seal` field (minus the transaction `selector`).
     ///
-    /// `control_root` and `bn254_control_id` are deployment parameters of
-    /// the RISC Zero verifier, not constants of this contract: callers that
-    /// want a pinned deployment must compare them against known values.
+    /// `control_root` and `bn254_control_id` are part of the *statement* being
+    /// proven, not a trust knob: both feed the five Groth16 public inputs, so a
+    /// wrong value simply fails to verify rather than widening what is accepted.
+    ///
+    /// This contract stores no wrapper identity and therefore supplies **no
+    /// reference values** to compare against — unlike the NEAR deployment, which
+    /// exposes `get_wrapper` / `is_wrapper_compatible` for exactly this. A caller
+    /// that wants "this receipt came from RISC Zero release X" must pin both
+    /// against X at integration time. `AGENTS.md` records where those constants
+    /// come from and when they must be re-pinned (any *verification* crate bump).
+    ///
     /// Malformed input returns `false`; never traps.
     pub fn verify_risc0_receipt(
         env: Env,

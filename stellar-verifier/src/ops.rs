@@ -54,9 +54,9 @@ pub(crate) use groth16_core::bn254::{G1_SIZE, G2_SIZE, SCALAR_SIZE};
 /// 32-byte big-endian encoding of a `BigInt<4>` given as its little-endian
 /// `u64` limbs (limb `i` covers wire bytes `8i..8i+8`, least-significant
 /// first; the reversal produces big-endian).
-fn be32_from_limbs(limbs: &[u64]) -> [u8; SCALAR_SIZE] {
+fn be32_from_limbs(limbs: &[u64; SCALAR_SIZE / 8]) -> [u8; SCALAR_SIZE] {
     let mut le = [0u8; SCALAR_SIZE];
-    for (i, w) in limbs.iter().take(4).enumerate() {
+    for (i, w) in limbs.iter().enumerate() {
         le[8 * i..8 * i + 8].copy_from_slice(&w.to_le_bytes());
     }
     le.reverse();
