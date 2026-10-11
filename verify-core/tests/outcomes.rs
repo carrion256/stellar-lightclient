@@ -234,6 +234,11 @@ fn outcome_claim_proves_inclusion_and_outcome() {
             hash: TestCrypto.sha256(&s.headers[0]),
         })
     );
+    // The fixture publishes the tail header's hash independently of our own
+    // computation (`header_hash_b64`), so comparing against it pins that
+    // `verify_span` derives the tail hash the network reports rather than
+    // merely one that is internally consistent with the header it was given.
+    assert_eq!(outcome.tail_hash, s.tail_hash);
 }
 
 #[test]
