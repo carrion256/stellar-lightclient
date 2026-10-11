@@ -392,4 +392,87 @@ mod tests {
         vk.delta_g2 = wrong_subgroup_g2();
         assert!(!verify(&NativeOps, &vk, &proof, &inputs));
     }
+
+    /// `verify_trusted_vk` is the path `groth16_core::risc0::verify` takes on
+    /// both chains, so its proof-side guards are the ones that run in
+    /// production. This pins that it rejects degenerate, off-curve and
+    /// wrong-subgroup proof input outright.
+    ///
+    /// This is **not** a comparison of two paths. `verify` performs the
+    /// verifying-key checks and then *delegates* to `verify_trusted_vk` for all
+    /// proof-side work, so the two cannot disagree on proof-side input by
+    /// construction — the checked-path assertions below record that delegation
+    /// rather than test it. What matters is the fast path's own behaviour: it
+    /// is the only path a receipt ever sees.
+    ///
+    /// Scoped to proof-side input deliberately. A bad *verifying key* is
+    /// rejected by `verify` and not by `verify_trusted_vk` — that is the whole
+    /// trade of the fast path, sound only because the VK is pinned at build
+    /// time. Those cases are `off_curve_vk_points_are_rejected` and
+    /// `wrong_subgroup_vk_point_is_rejected`.
+    #[test]
+    fn trusted_vk_fast_path_rejects_bad_proof_input() {
+        let zero_g1 = G1::new_unchecked(Fq::from(0u64), Fq::from(0u64));
+        let zero_g2 = G2::new_unchecked(
+            Fq2::new(Fq::from(0u64), Fq::from(0u64)),
+            Fq2::new(Fq::from(0u64), Fq::from(0u64)),
+        );
+        let check = |name: &str, vk: &VerifyingKey, proof: &Proof, inputs: &[Fr]| {
+            assert!(!verify(&NativeOps, vk, proof, inputs), "{name}: checked path rejects");
+            assert!(
+                !verify_trusted_vk(&NativeOps, vk, proof, inputs),
+                "{name}: trusted-VK path rejects"
+            );
+        };
+
+        // Positive control: the fast path must not reject a good proof either,
+        // so the negatives below are rejections rather than an always-`false`.
+        let (vk, proof, inputs) = satisfying();
+        assert!(verify(&NativeOps, &vk, &proof, &inputs));
+        assert!(verify_trusted_vk(&NativeOps, &vk, &proof, &inputs));
+
+        // Shape.
+        let (mut vk, proof, _) = satisfying();
+        vk.ic.clear();
+        check("empty ic", &vk, &proof, &[]);
+        let (vk, proof, _) = satisfying();
+        check("too few inputs", &vk, &proof, &[]);
+        check("too many inputs", &vk, &proof, &[Fr::from(0u64), Fr::from(1u64)]);
+
+        // Degeneracy.
+        let (vk, mut proof, inputs) = satisfying();
+        proof.a = G1::identity();
+        proof.c = g1_mul(-Fr::from(2u64));
+        check("identity A", &vk, &proof, &inputs);
+        let (vk, mut proof, inputs) = satisfying();
+        proof.b = G2::identity();
+        proof.c = g1_mul(-Fr::from(2u64));
+        check("identity B", &vk, &proof, &inputs);
+        let (vk, mut proof, mut inputs) = satisfying();
+        proof.c = G1::identity();
+        inputs[0] = -Fr::from(1u64);
+        check("identity C", &vk, &proof, &inputs);
+        let (vk, mut proof, inputs) = satisfying();
+        proof.a = zero_g1;
+        check("zero-coordinate A", &vk, &proof, &inputs);
+        let (vk, mut proof, inputs) = satisfying();
+        proof.b = zero_g2;
+        check("zero-coordinate B", &vk, &proof, &inputs);
+
+        // On-curve.
+        let (vk, mut proof, inputs) = satisfying();
+        proof.a = off_curve_g1();
+        check("off-curve A", &vk, &proof, &inputs);
+        let (vk, mut proof, inputs) = satisfying();
+        proof.b = off_curve_g2();
+        check("off-curve B", &vk, &proof, &inputs);
+        let (vk, mut proof, inputs) = satisfying();
+        proof.c = G1::new_unchecked(ark_bn254::Fq::from(2u64), ark_bn254::Fq::from(1u64));
+        check("off-curve C", &vk, &proof, &inputs);
+
+        // Subgroup.
+        let (vk, mut proof, inputs) = satisfying();
+        proof.b = wrong_subgroup_g2();
+        check("wrong-subgroup B", &vk, &proof, &inputs);
+    }
 }
