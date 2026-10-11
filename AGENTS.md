@@ -24,9 +24,15 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
   If any *verification* crate bumps, re-transcribe the VK and re-pin the claim
   digest before trusting a receipt. Re-pin in `groth16-core`, **not** in
   `verifier/src/risc0.rs` or `verifier/src/claim.rs` — those are thin NEAR
-  adapters over the shared crate and hold no constants of their own. The
-  definitive check is to build a seal and confirm its `bn254_control_id`
-  matches the contract's pinned value.
+  adapters over the shared crate and hold no constants of their own.
+  The definitive check is to build a seal and confirm its `bn254_control_id`
+  matches the deployed value. Note the two chains differ here: the NEAR contract
+  *stores* `control_root`/`bn254_control_id` (set by `update_wrapper`, readable
+  via `get_wrapper`, comparable via `is_wrapper_compatible`), so it has a pinned
+  value to check against. The Soroban contract does not — it is a stateless
+  verifier and takes both as caller-supplied arguments, so there is nothing to
+  compare against in the deployment and the caller must pin them at integration
+  time.
 - OpenSSL headers + `pkg-config`, so `openssl-sys` (pulled in by near-workspaces)
   builds against nix's openssl instead of compiling from source.
 - `commit.gpgsign=false` for the session only, via `GIT_CONFIG_*` — this
