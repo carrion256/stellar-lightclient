@@ -115,12 +115,18 @@ pub fn seal_to_proof(seal: &[u8]) -> Result<Proof, String> {
     }
     // Split into 32-byte big-endian field elements exactly as Seal::decode does
     // (types.rs:80-100): a = [e0, e1], b = [[e2, e3], [e4, e5]], c = [e6, e7].
-    let e = |i: usize| &seal[i * SCALAR_SIZE..(i + 1) * SCALAR_SIZE];
+    // Fixed-size chunks read fallibly: a panic here would be a contract trap,
+    // not a diagnostic, so panic-freedom must not rest on the length check
+    // above staying where it is.
+    let e = |i: usize| -> Result<&[u8], String> {
+        seal.get(i * SCALAR_SIZE..i.saturating_add(1) * SCALAR_SIZE)
+            .ok_or_else(|| "seal: truncated field element".into())
+    };
     Ok(Proof {
-        a: g1_from_be_raw([e(0), e(1)]).map_err(|_| "seal a: invalid G1 point")?,
-        b: g2_from_be_raw([[e(2), e(3)], [e(4), e(5)]])
+        a: g1_from_be_raw([e(0)?, e(1)?]).map_err(|_| "seal a: invalid G1 point")?,
+        b: g2_from_be_raw([[e(2)?, e(3)?], [e(4)?, e(5)?]])
             .map_err(|_| "seal b: invalid G2 point")?,
-        c: g1_from_be_raw([e(6), e(7)]).map_err(|_| "seal c: invalid G1 point")?,
+        c: g1_from_be_raw([e(6)?, e(7)?]).map_err(|_| "seal c: invalid G1 point")?,
     })
 }
 

@@ -280,6 +280,28 @@ fn seal_wrong_length_is_error() {
     assert!(risc0::seal_to_proof(&[0u8; 256]).is_err());
 }
 
+/// Panic-freedom across *every* length, not just the boundaries. Both parsers
+/// read untrusted bytes inside contracts, where a panic is a trap rather than
+/// a diagnostic, so the property is "no input length unwinds" — and a boundary
+/// test can pass while an interior length still indexes out of range.
+///
+/// The length checks above these reads are convenience, not the safety
+/// mechanism: removing one must not turn a rejection into a trap.
+#[test]
+fn untrusted_parsers_never_panic_on_any_length() {
+    for len in 0..=288 {
+        let bytes = vec![0xABu8; len];
+        let _ = risc0::seal_to_proof(&bytes);
+        let _ = verifier::claim::ReceiptClaim::decode(&bytes);
+    }
+    // Exact lengths are then content-checked, not length-panicking.
+    assert!(risc0::seal_to_proof(&[0u8; 256]).is_err(), "zero seal is not a proof");
+    assert!(
+        verifier::claim::ReceiptClaim::decode(&[0u8; 104]).is_ok(),
+        "an all-zero claim is well-formed (output pruned to None)"
+    );
+}
+
 /// Serialize a G1 point into the seal layout: x, y big-endian, 32 bytes each.
 fn encode_g1_into(p: &G1, out: &mut [u8]) {
     let mut x = [0u8; 32];

@@ -76,14 +76,17 @@ impl ReceiptClaim {
 
     /// Inverse of [`ReceiptClaim::encode`].
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        // Fallible reads rather than indexing + `unwrap`. A panic here is a
+        // contract trap, not a diagnostic, so memory safety must not rest on
+        // the length check below staying where it is.
         if bytes.len() != 104 {
             return Err("receipt claim must be 104 bytes".into());
         }
-        let pre: [u8; 32] = bytes[0..32].try_into().unwrap();
-        let post: [u8; 32] = bytes[32..64].try_into().unwrap();
-        let output: [u8; 32] = bytes[64..96].try_into().unwrap();
-        let sys_exit = u32::from_le_bytes(bytes[96..100].try_into().unwrap());
-        let user_exit = u32::from_le_bytes(bytes[100..104].try_into().unwrap());
+        let pre = chunk::<32>(bytes, 0)?;
+        let post = chunk::<32>(bytes, 32)?;
+        let output = chunk::<32>(bytes, 64)?;
+        let sys_exit = u32::from_le_bytes(chunk::<4>(bytes, 96)?);
+        let user_exit = u32::from_le_bytes(chunk::<4>(bytes, 100)?);
         Ok(Self {
             pre,
             post,
@@ -95,6 +98,15 @@ impl ReceiptClaim {
             user_exit,
         })
     }
+}
+
+/// Read an `N`-byte chunk at `at` without indexing or unwrapping. `None` rather
+/// than a panic on any out-of-range or short read.
+fn chunk<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], String> {
+    bytes
+        .get(at..at.saturating_add(N))
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| "receipt claim must be 104 bytes".into())
 }
 
 /// SHA-256 of raw bytes — identical to `risc0_zkp::core::hash::sha::cpu::Impl::hash_bytes`
