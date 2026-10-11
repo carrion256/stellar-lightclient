@@ -412,3 +412,38 @@ fn risc0_receipt_with_wrong_journal_is_rejected() {
     );
     assert!(!result);
 }
+
+/// A malformed seal must return `false`, never trap. The length conversion to
+/// `[u8; SEAL_SIZE]` is where a wrong-sized seal would surface as a panic if it
+/// were unwrapped instead of matched, so pin the boundary on both sides.
+#[test]
+fn risc0_receipt_rejects_malformed_seals_without_trapping() {
+    let env = Env::default();
+    let f = risc0_fixture();
+    let seal = hex_bytes(&f["seal"]);
+    let call = |seal_bytes: &[u8]| {
+        StellarVerifier::verify_risc0_receipt(
+            env.clone(),
+            BytesN::from_array(&env, &hex_bytes(&f["image_id"]).try_into().unwrap()),
+            Bytes::from_slice(&env, &hex_bytes(&f["journal"])),
+            Bytes::from_slice(&env, seal_bytes),
+            BytesN::from_array(&env, &hex_bytes(&f["control_root"]).try_into().unwrap()),
+            BytesN::from_array(&env, &hex_bytes(&f["bn254_control_id"]).try_into().unwrap()),
+        )
+    };
+
+    // Length boundaries: one short and one long.
+    assert!(!call(&seal[..seal.len() - 1]), "truncated seal must be rejected");
+    let mut overlong = seal.clone();
+    overlong.push(0);
+    assert!(!call(&overlong), "overlong seal must be rejected");
+
+    // Right length, wrong contents: a flipped coordinate byte must not verify.
+    let mut tampered = seal.clone();
+    tampered[0] ^= 0x01;
+    assert!(!call(&tampered), "tampered seal must be rejected");
+
+    // And the untouched seal still verifies, so the negatives are rejections
+    // and not a test that only ever sees `false`.
+    assert!(call(&seal), "the genuine seal must still verify");
+}

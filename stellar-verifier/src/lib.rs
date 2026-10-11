@@ -185,7 +185,7 @@ impl StellarVerifier {
         ) else {
             return false;
         };
-        let Ok(seal) = <[u8; 256]>::try_from(seal) else {
+        let Ok(seal) = <[u8; SEAL_SIZE]>::try_from(seal) else {
             return false;
         };
         let Ok(proof) = groth16_core::risc0::seal_to_proof(&seal) else {
