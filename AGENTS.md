@@ -17,13 +17,16 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
 - Rust (stable) with the `wasm32-unknown-unknown` and `wasm32v1-none` targets
   preinstalled (the latter for Soroban contracts).
 - `cargo-risczero` **3.0.6** (with `r0vm`), from nix. The pinned Groth16
-  verifying key in `verifier/src/risc0.rs` and the `ReceiptClaim` digest in
-  `verifier/src/claim.rs` come from the **3.0.5** verification crates
+  verifying key in `groth16-core/src/risc0.rs` and the `ReceiptClaim` digest in
+  `groth16-core/src/claim.rs` come from the **3.0.5** verification crates
   (`risc0-groth16`, `risc0-binfmt`, `risc0-zkp`) — those did not move between
   3.0.5 and 3.0.6, so the wrapper identity is expected to be unchanged.
   If any *verification* crate bumps, re-transcribe the VK and re-pin the claim
-  digest before trusting a receipt. The definitive check is to build a seal and
-  confirm its `bn254_control_id` matches the contract's pinned value.
+  digest before trusting a receipt. Re-pin in `groth16-core`, **not** in
+  `verifier/src/risc0.rs` or `verifier/src/claim.rs` — those are thin NEAR
+  adapters over the shared crate and hold no constants of their own. The
+  definitive check is to build a seal and confirm its `bn254_control_id`
+  matches the contract's pinned value.
 - OpenSSL headers + `pkg-config`, so `openssl-sys` (pulled in by near-workspaces)
   builds against nix's openssl instead of compiling from source.
 - `commit.gpgsign=false` for the session only, via `GIT_CONFIG_*` — this

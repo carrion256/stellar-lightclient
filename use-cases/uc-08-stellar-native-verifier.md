@@ -94,9 +94,10 @@ G2 coefficient order is worse than a trap: it produces proofs that simply fail t
 verify, which reads as a bad proof rather than a bad port.
 
 The seam already exists. Groth16 verification is exactly one multiexp and one
-multi-pairing check (`verifier/src/groth16.rs:138-153`), so the chain-specific
-part is two functions and a byte encoding. Behind a provider, the whole proof
-system is shared — which is how `groth16-core` is now structured.
+multi-pairing check (`groth16-core/src/groth16.rs:155-163`) — and that code is
+already chain-agnostic, sitting in the shared core behind `impl ProofOps`. So
+the chain-specific part is two functions and a byte encoding, and nothing of
+the proof system needs porting.
 
 There is a measured cost datum to start from: the test in
 `verifier/tests/risc0_verify.rs:116-120` times one Groth16 verification as a
