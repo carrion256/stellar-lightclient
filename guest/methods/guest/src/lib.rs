@@ -33,8 +33,18 @@ impl Crypto for Sha256Dalek {
             return false;
         };
         let sig = Signature::from_bytes(signature);
-        // Non-strict: matches nearcore's host ed25519_verify, so the guest
-        // accepts exactly the same signatures as the on-chain check.
+        // `verify`, not `verify_strict`. In this crate the two differ by exactly
+        // one check: `verify_strict` additionally rejects small-order `R` or `A`
+        // (ed25519-dalek `verifying.rs`), and `verify` is the one matching
+        // nearcore's host `ed25519_verify`. Non-canonical `S` is *not* the
+        // difference — both paths reject it — so that is not what "non-strict"
+        // refers to here.
+        //
+        // The property is "accepts exactly what the chain accepts", pinned case
+        // by case in `verifier/tests/host_ed25519_parity.rs`. Known gap: that
+        // corpus has no small-order `R`/`A` case, which is the one axis where the
+        // two rules actually part; building a signature valid under a weak key
+        // needs a degenerate nonce.
         key.verify(message, &sig).is_ok()
     }
 }
