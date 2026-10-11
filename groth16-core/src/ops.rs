@@ -33,18 +33,23 @@ pub trait ProofOps {
 
     /// Multi-scalar multiplication in G1: `Σ points[i] · scalars[i]`.
     ///
-    /// `points.len()` must equal `scalars.len()`. Providers must normalize the
-    /// empty case to the identity **before** touching the host — not every host
-    /// accepts an empty buffer, so this is a requirement on the provider, not
-    /// something the host does for you.
+    /// `points.len()` must equal `scalars.len()`. Providers normalize the empty
+    /// case to the identity before touching the host.
+    ///
+    /// That normalization is **load-bearing on Soroban**, where `pairing_check`
+    /// panics on an empty vector, and **defensive on NEAR**, whose
+    /// `alt_bn128_*` already returns the identity for an empty buffer —
+    /// established by deleting the early return and re-running the suite rather
+    /// than assumed. Either way `groth16_core::groth16::verify` never calls this
+    /// with an empty slice.
     fn g1_multiexp(&self, points: &[G1], scalars: &[Fr]) -> G1;
 
     /// Multi-pairing product check: `∏ e(pairs[i].0, pairs[i].1) == 1`.
     ///
-    /// Providers must normalize the empty case to `true` before touching the
-    /// host: Soroban's `Bn254::pairing_check` *panics* on an empty or mismatched
-    /// vector while NEAR's returns `true`, so the shared core cannot rely on the
-    /// host for this. `groth16_core::groth16::verify` never calls this with an
-    /// empty or mismatched slice.
+    /// Providers normalize the empty case to `true` before touching the host.
+    /// Same split as [`ProofOps::g1_multiexp`]: Soroban's `Bn254::pairing_check`
+    /// *panics* on an empty or mismatched vector, NEAR's returns `true` on its
+    /// own. `groth16_core::groth16::verify` never calls this with an empty or
+    /// mismatched slice.
     fn pairing_check(&self, pairs: &[(G1, G2)]) -> bool;
 }

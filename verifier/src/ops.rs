@@ -41,6 +41,11 @@ impl ProofOps for NearOps {
                 scalars.len()
             );
         }
+        // Defensive on NEAR — the host returns the identity for an empty buffer
+        // anyway (verified by removing this and running the suite). Kept so the
+        // provider honours the `ProofOps` contract by construction rather than
+        // by host behaviour, and to skip the host call. The trait doc records
+        // which backend actually depends on it.
         if points.is_empty() {
             return G1::identity();
         }
@@ -65,6 +70,8 @@ impl ProofOps for NearOps {
     /// Empty input returns `true` (empty pairing product is the identity),
     /// without touching the host.
     fn pairing_check(&self, pairs: &[(G1, G2)]) -> bool {
+        // Same as `g1_multiexp`: defensive on NEAR, load-bearing on Soroban,
+        // whose `pairing_check` panics on an empty vector.
         if pairs.is_empty() {
             return true;
         }
