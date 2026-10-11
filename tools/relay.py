@@ -144,20 +144,25 @@ def encode_borsh(span: dict) -> bytes:
     def option(value):
         return b"\x00" if value is None else b"\x01" + borsh_bytes(b64(value))
 
-    out = option(span["start_header"])
-    out += borsh_vec_bytes([b64(h) for h in span["headers"]])
-    out += borsh_vec_bytes([b64(e) for e in span["tail_envelopes"]])
-    out += option(span["tail_tx_set_xdr"])
-    out += struct.pack("<I", len(span["tx_claims"]))
+    # Accumulate and join once. `out += ...` in the claim loops re-copies the
+    # whole buffer on every append — with an ~89 KB transaction set already in
+    # there that is O(total x claims) copying for no reason.
+    parts = [
+        option(span["start_header"]),
+        borsh_vec_bytes([b64(h) for h in span["headers"]]),
+        borsh_vec_bytes([b64(e) for e in span["tail_envelopes"]]),
+        option(span["tail_tx_set_xdr"]),
+        struct.pack("<I", len(span["tx_claims"])),
+    ]
     for claim in span["tx_claims"]:
-        out += borsh_bytes(b64(claim["tx_envelope_xdr"]))
-        out += struct.pack("<I", claim["tx_index"])
-    out += struct.pack("<I", len(span["outcome_claims"]))
+        parts.append(borsh_bytes(b64(claim["tx_envelope_xdr"])))
+        parts.append(struct.pack("<I", claim["tx_index"]))
+    parts.append(struct.pack("<I", len(span["outcome_claims"])))
     for claim in span["outcome_claims"]:
-        out += borsh_bytes(b64(claim["tx_envelope_xdr"]))
-        out += borsh_bytes(b64(claim["tx_result_xdr"]))
-    out += option(span["tail_results_xdr"])
-    return out
+        parts.append(borsh_bytes(b64(claim["tx_envelope_xdr"])))
+        parts.append(borsh_bytes(b64(claim["tx_result_xdr"])))
+    parts.append(option(span["tail_results_xdr"]))
+    return b"".join(parts)
 
 
 def main() -> int:
