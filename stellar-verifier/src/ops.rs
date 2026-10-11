@@ -45,18 +45,17 @@ use groth16_core::{Fr, G1, G2, ProofOps};
 use soroban_sdk::crypto::bn254::{Bn254Fr, Bn254G1Affine, Bn254G2Affine};
 use soroban_sdk::{Bytes, BytesN, Env, Vec as HostVec};
 
-/// Wire size of a scalar-field element.
-pub(crate) const FR_WIRE_LEN: usize = 32;
-/// Wire size of a G1 point.
-pub(crate) const G1_WIRE_LEN: usize = 64;
-/// Wire size of a G2 point.
-pub(crate) const G2_WIRE_LEN: usize = 128;
+/// Wire sizes come from the shared point layout in `groth16_core::bn254`,
+/// which both chains agree on (`a(G1) ‖ b(G2) ‖ c(G1)` is 256 bytes
+/// everywhere). Only the *byte order* differs, and that is what the functions
+/// below implement.
+pub(crate) use groth16_core::bn254::{G1_SIZE, G2_SIZE, SCALAR_SIZE};
 
 /// 32-byte big-endian encoding of a `BigInt<4>` given as its little-endian
 /// `u64` limbs (limb `i` covers wire bytes `8i..8i+8`, least-significant
 /// first; the reversal produces big-endian).
-fn be32_from_limbs(limbs: &[u64]) -> [u8; 32] {
-    let mut le = [0u8; 32];
+fn be32_from_limbs(limbs: &[u64]) -> [u8; SCALAR_SIZE] {
+    let mut le = [0u8; SCALAR_SIZE];
     for (i, w) in limbs.iter().take(4).enumerate() {
         le[8 * i..8 * i + 8].copy_from_slice(&w.to_le_bytes());
     }
@@ -75,7 +74,7 @@ fn at<const N: usize>(b: &[u8], start: usize) -> Option<&[u8; N]> {
 /// (or one with the host's0x80/0x40 flag bits set — unreachable for
 /// canonical values since `p < 2^254`) reduces to a different value and
 /// fails the round-trip comparison.
-fn fq_from_wire(b: &[u8; 32]) -> Option<Fq> {
+fn fq_from_wire(b: &[u8; SCALAR_SIZE]) -> Option<Fq> {
     let mut le = *b;
     le.reverse();
     let v = Fq::from_le_bytes_mod_order(&le);
@@ -86,7 +85,7 @@ fn fq_from_wire(b: &[u8; 32]) -> Option<Fq> {
 /// [`fq_from_wire`] against `r`. Non-canonical scalars are rejected, never
 /// silently reduced (matching the NEAR provider's strictness and
 /// `groth16_core::risc0::public_inputs`' documented error path).
-pub(crate) fn fr_from_wire(b: &[u8; 32]) -> Option<Fr> {
+pub(crate) fn fr_from_wire(b: &[u8; SCALAR_SIZE]) -> Option<Fr> {
     let mut le = *b;
     le.reverse();
     let v = Fr::from_le_bytes_mod_order(&le);
@@ -94,19 +93,19 @@ pub(crate) fn fr_from_wire(b: &[u8; 32]) -> Option<Fr> {
 }
 
 /// Encode a scalar as 32-byte big-endian.
-pub(crate) fn fr_to_wire(fr: &Fr) -> [u8; 32] {
+pub(crate) fn fr_to_wire(fr: &Fr) -> [u8; SCALAR_SIZE] {
     be32_from_limbs(&fr.into_bigint().0)
 }
 
 /// Encode a G1 point as `be_bytes(X) || be_bytes(Y)`; the identity becomes
 /// 64 zero bytes (the host's infinity encoding).
-pub(crate) fn g1_to_wire(p: &G1) -> [u8; G1_WIRE_LEN] {
+pub(crate) fn g1_to_wire(p: &G1) -> [u8; G1_SIZE] {
     if p.infinity {
-        return [0u8; G1_WIRE_LEN];
+        return [0u8; G1_SIZE];
     }
-    let mut out = [0u8; G1_WIRE_LEN];
-    out[..32].copy_from_slice(&be32_from_limbs(&p.x.into_bigint().0));
-    out[32..].copy_from_slice(&be32_from_limbs(&p.y.into_bigint().0));
+    let mut out = [0u8; G1_SIZE];
+    out[..SCALAR_SIZE].copy_from_slice(&be32_from_limbs(&p.x.into_bigint().0));
+    out[SCALAR_SIZE..].copy_from_slice(&be32_from_limbs(&p.y.into_bigint().0));
     out
 }
 
@@ -115,12 +114,12 @@ pub(crate) fn g1_to_wire(p: &G1) -> [u8; G1_WIRE_LEN] {
 /// subgroup checks are deliberately *not* done here — they run in
 /// `groth16_core::groth16::verify` before any host call, keeping the entry point
 /// total for adversarial input.
-pub(crate) fn g1_from_wire(b: &[u8; G1_WIRE_LEN]) -> Option<G1> {
-    if *b == [0u8; G1_WIRE_LEN] {
+pub(crate) fn g1_from_wire(b: &[u8; G1_SIZE]) -> Option<G1> {
+    if *b == [0u8; G1_SIZE] {
         return Some(G1::identity());
     }
-    let x = fq_from_wire(at::<32>(b, 0)?)?;
-    let y = fq_from_wire(at::<32>(b, 32)?)?;
+    let x = fq_from_wire(at::<SCALAR_SIZE>(b, 0)?)?;
+    let y = fq_from_wire(at::<SCALAR_SIZE>(b, SCALAR_SIZE)?)?;
     Some(G1::new_unchecked(x, y))
 }
 
@@ -128,29 +127,31 @@ pub(crate) fn g1_from_wire(b: &[u8; G1_WIRE_LEN]) -> Option<G1> {
 /// coordinate `be_bytes(c1) || be_bytes(c0)` — c1 (imaginary) first, the
 /// Ethereum order quoted in the module docs; the identity becomes 128 zero
 /// bytes.
-pub(crate) fn g2_to_wire(p: &G2) -> [u8; G2_WIRE_LEN] {
+pub(crate) fn g2_to_wire(p: &G2) -> [u8; G2_SIZE] {
     if p.infinity {
-        return [0u8; G2_WIRE_LEN];
+        return [0u8; G2_SIZE];
     }
-    let mut out = [0u8; G2_WIRE_LEN];
-    out[0..32].copy_from_slice(&be32_from_limbs(&p.x.c1.into_bigint().0));
-    out[32..64].copy_from_slice(&be32_from_limbs(&p.x.c0.into_bigint().0));
-    out[64..96].copy_from_slice(&be32_from_limbs(&p.y.c1.into_bigint().0));
-    out[96..].copy_from_slice(&be32_from_limbs(&p.y.c0.into_bigint().0));
+    let mut out = [0u8; G2_SIZE];
+    out[0..SCALAR_SIZE].copy_from_slice(&be32_from_limbs(&p.x.c1.into_bigint().0));
+    out[SCALAR_SIZE..2 * SCALAR_SIZE]
+        .copy_from_slice(&be32_from_limbs(&p.x.c0.into_bigint().0));
+    out[2 * SCALAR_SIZE..3 * SCALAR_SIZE]
+        .copy_from_slice(&be32_from_limbs(&p.y.c1.into_bigint().0));
+    out[3 * SCALAR_SIZE..].copy_from_slice(&be32_from_limbs(&p.y.c0.into_bigint().0));
     out
 }
 
 /// Decode a G2 point; wire order `x.c1 || x.c0 || y.c1 || y.c0` (Ethereum),
 /// canonical field elements required, all-zero input is the identity.
 /// On-curve/subgroup checks run in `groth16_core::groth16::verify`.
-pub(crate) fn g2_from_wire(b: &[u8; G2_WIRE_LEN]) -> Option<G2> {
-    if *b == [0u8; G2_WIRE_LEN] {
+pub(crate) fn g2_from_wire(b: &[u8; G2_SIZE]) -> Option<G2> {
+    if *b == [0u8; G2_SIZE] {
         return Some(G2::identity());
     }
-    let x_c1 = fq_from_wire(at::<32>(b, 0)?)?;
-    let x_c0 = fq_from_wire(at::<32>(b, 32)?)?;
-    let y_c1 = fq_from_wire(at::<32>(b, 64)?)?;
-    let y_c0 = fq_from_wire(at::<32>(b, 96)?)?;
+    let x_c1 = fq_from_wire(at::<SCALAR_SIZE>(b, 0)?)?;
+    let x_c0 = fq_from_wire(at::<SCALAR_SIZE>(b, SCALAR_SIZE)?)?;
+    let y_c1 = fq_from_wire(at::<SCALAR_SIZE>(b, 2 * SCALAR_SIZE)?)?;
+    let y_c0 = fq_from_wire(at::<SCALAR_SIZE>(b, 3 * SCALAR_SIZE)?)?;
     Some(G2::new_unchecked(Fq2::new(x_c0, x_c1), Fq2::new(y_c0, y_c1)))
 }
 

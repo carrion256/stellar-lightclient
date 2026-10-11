@@ -54,37 +54,40 @@ use soroban_sdk::{contract, contractimpl, Bytes, BytesN, Env};
 
 mod ops;
 
-use ops::{fr_from_wire, g1_from_wire, g2_from_wire, take, G1_WIRE_LEN, G2_WIRE_LEN, FR_WIRE_LEN};
+use ops::{fr_from_wire, g1_from_wire, g2_from_wire, take, G1_SIZE, G2_SIZE, SCALAR_SIZE};
+use groth16_core::bn254::SEAL_SIZE;
 
 #[cfg(test)]
 mod tests;
 
 /// `alpha_g1 || beta_g2 || gamma_g2 || delta_g2`.
-const VK_HEADER_LEN: usize = G1_WIRE_LEN + 3 * G2_WIRE_LEN; // 448
-/// `a || b || c`.
-const PROOF_LEN: usize = 2 * G1_WIRE_LEN + G2_WIRE_LEN; // 256
+const VK_HEADER_LEN: usize = G1_SIZE + 3 * G2_SIZE; // 448
+/// `a || b || c`. This is the Groth16 proof wire format and the RISC Zero
+/// `Seal::SIZE` simultaneously — the same 256 bytes on both chains — so it
+/// comes from the shared layout rather than being re-derived here.
+const PROOF_LEN: usize = SEAL_SIZE;
 
 /// Decode the verifying-key wire format; `None` on any length or
 /// canonicality violation (points may be off-curve here — the pre-checks
 /// run in `groth16_core::groth16::verify`).
 fn decode_vk(b: &Bytes) -> Option<VerifyingKey> {
     let len = b.len() as usize;
-    if len < VK_HEADER_LEN || (len - VK_HEADER_LEN) % G1_WIRE_LEN != 0 {
+    if len < VK_HEADER_LEN || (len - VK_HEADER_LEN) % G1_SIZE != 0 {
         return None;
     }
     let mut at = 0u32;
     let alpha_g1 = g1_from_wire(&take(b, at)?)?;
-    at += G1_WIRE_LEN as u32;
+    at += G1_SIZE as u32;
     let beta_g2 = g2_from_wire(&take(b, at)?)?;
-    at += G2_WIRE_LEN as u32;
+    at += G2_SIZE as u32;
     let gamma_g2 = g2_from_wire(&take(b, at)?)?;
-    at += G2_WIRE_LEN as u32;
+    at += G2_SIZE as u32;
     let delta_g2 = g2_from_wire(&take(b, at)?)?;
-    at += G2_WIRE_LEN as u32;
+    at += G2_SIZE as u32;
     let mut ic = Vec::new();
     while (at as usize) < len {
         ic.push(g1_from_wire(&take(b, at)?)?);
-        at += G1_WIRE_LEN as u32;
+        at += G1_SIZE as u32;
     }
     Some(VerifyingKey {
         alpha_g1,
@@ -102,21 +105,21 @@ fn decode_proof(b: &Bytes) -> Option<Proof> {
     }
     Some(Proof {
         a: g1_from_wire(&take(b, 0)?)?,
-        b: g2_from_wire(&take(b, G1_WIRE_LEN as u32)?)?,
-        c: g1_from_wire(&take(b, (G1_WIRE_LEN + G2_WIRE_LEN) as u32)?)?,
+        b: g2_from_wire(&take(b, G1_SIZE as u32)?)?,
+        c: g1_from_wire(&take(b, (G1_SIZE + G2_SIZE) as u32)?)?,
     })
 }
 
 /// Decode `32·n` bytes of canonical big-endian public inputs.
 fn decode_inputs(b: &Bytes) -> Option<Vec<Fr>> {
-    if b.len() % (FR_WIRE_LEN as u32) != 0 {
+    if b.len() % (SCALAR_SIZE as u32) != 0 {
         return None;
     }
     let mut out = Vec::new();
     let mut at = 0u32;
     while at < b.len() {
         out.push(fr_from_wire(&take(b, at)?)?);
-        at += FR_WIRE_LEN as u32;
+        at += SCALAR_SIZE as u32;
     }
     Some(out)
 }
