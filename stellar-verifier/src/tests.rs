@@ -234,18 +234,38 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
     let ic1_at = 448 + 64;
     bad_vk_wire[ic1_at..ic1_at + 64].copy_from_slice(&g1_to_wire(&vk.alpha_g1));
 
+    // Swapped A and C: a well-formed proof with the two G1 slots exchanged.
+    // Exercises the G1 wire codec in two different positions of the same
+    // buffer, which a per-point unit test cannot.
+    let swapped = groth16_core::Proof {
+        a: proof.c,
+        b: proof.b,
+        c: proof.a,
+    };
+    let mut swapped_wire = proof_wire.clone();
+    // A is bytes 0..64, C is bytes 192..256 of the 256-byte proof wire.
+    let (head, tail) = swapped_wire.split_at_mut(192);
+    let mut a_block = [0u8; 64];
+    a_block.copy_from_slice(&head[..64]);
+    head[..64].copy_from_slice(&tail[..64]);
+    tail[..64].copy_from_slice(&a_block);
+
     let cases: Vec<(
         &str,
         &Vec<u8>,                    // vk wire for the host path
         &groth16_core::VerifyingKey, // vk for the native path
+        &Vec<u8>,                    // proof wire for the host path
+        &groth16_core::Proof,        // proof for the native path
         &[u8],                       // inputs wire for the host path
         &[Fr],                       // inputs for the native path
     )> = vec![
-        ("valid", &vk_wire, &vk, &inputs_wire, &inputs),
+        ("valid", &vk_wire, &vk, &proof_wire, &proof, &inputs_wire, &inputs),
         (
             "wrong public input",
             &vk_wire,
             &vk,
+            &proof_wire,
+            &proof,
             &bad_inputs_wire,
             &bad_inputs,
         ),
@@ -253,15 +273,26 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
             "corrupted verifying key",
             &bad_vk_wire,
             &bad_vk,
+            &proof_wire,
+            &proof,
+            &inputs_wire,
+            &inputs,
+        ),
+        (
+            "swapped A and C",
+            &vk_wire,
+            &vk,
+            &swapped_wire,
+            &swapped,
             &inputs_wire,
             &inputs,
         ),
     ];
 
-    for (name, vk_w, vk_c, in_w, native_inputs) in cases {
+    for (name, vk_w, vk_c, proof_w, proof_c, in_w, native_inputs) in cases {
         let env = Env::default();
-        let via_host = call_verify(&env, vk_w, &proof_wire, in_w);
-        let via_native = groth16_core::groth16::verify(&NativeOps, vk_c, &proof, native_inputs);
+        let via_host = call_verify(&env, vk_w, proof_w, in_w);
+        let via_native = groth16_core::groth16::verify(&NativeOps, vk_c, proof_c, native_inputs);
         assert_eq!(
             via_host, via_native,
             "wire path and native reference disagree on case: {name}"
