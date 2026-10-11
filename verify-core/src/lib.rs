@@ -479,29 +479,35 @@ fn check_protocol(version: u32, trust: &Trust) -> Result<(), Error> {
 /// Verify signatures of trusted nodes externalizing exactly the header's SCP
 /// value. One pass; stops as soon as the threshold is met.
 ///
-/// **This is where the time goes.** Measured on a 2-header span with a 30-node
-/// trust set at threshold 30 (release, software `ed25519`): `verify_span` runs
-/// ~73 ms, and stubbing `ed25519_verify` drops it to ~0.9 ms — so signature
-/// verification is ~99% of the total. Everything else (header/envelope XDR
-/// decode, set hashing, the chain walk) is the remaining ~1%.
+/// **This is where the time goes** on the hardware I measured on. A 2-header
+/// span over a 30-node trust set at threshold 30 runs ~73 ms in `verify_span`;
+/// stubbing `ed25519_verify` drops it to ~0.9 ms. On this host that reads ~99%
+/// signature verification against ~1% for everything else (header/envelope XDR
+/// decode, set hashing, the chain walk) — but that split is this machine's, not
+/// the code's; the hardware-independent conclusion is below.
 ///
-/// Two consequences for anyone optimising here. First, the cost scales with
-/// `threshold`, not with the number of envelopes supplied: the `break` below
-/// stops once quorum is reached, so surplus envelopes cost only their XDR
-/// decode and never reach a signature. A smaller trust set is the lever.
-/// ed25519 has a batch-verification algorithm that is exactly the shortcut this
-/// would otherwise want, but NEAR exposes no batch host function, so through
-/// `Crypto` there is no path to it. Second, work elsewhere in `verify_span`
-/// cannot move the total by much — the outcome path measured ~1% of it — so
-/// optimisations there are worth doing for their own sake and not for end-to-end
-/// effect.
+/// Why there is no further code-level win here: `threshold` signatures are
+/// mandatory — they are the security parameter, not an implementation choice —
+/// and NEAR exposes no batch-ed25519 host function, so through `Crypto` there is
+/// no way to verify them as anything but `threshold` individual calls. (Batch
+/// verification *is* the usual shortcut for exactly this; it is unreachable
+/// here, not nonexistent.) That argument is hardware-independent and is the one
+/// to rest on. The lever is a smaller trust set, and the `break` below already
+/// stops at quorum, so surplus envelopes cost only their XDR decode and never
+/// reach a signature.
 ///
-/// (Measured release, single-threaded, on this host: ~2.4ms per signature via
-/// software `ed25519-dalek` *and* via the `ed25519_verify` host function under
-/// the near-sdk mock — the two were within 1% of each other, so the share above
-/// is not an artefact of a slow harness backend. The absolute figure is high for
-/// ed25519 and may reflect this host; the ratio between signature and
-/// non-signature work is the part to rely on.)
+/// How much of the total those signatures are is *not* hardware-independent and
+/// is not a property of this code. On this host, release, single-threaded:
+/// ~2.4ms per signature through `env::ed25519_verify` under the near-sdk mock,
+/// ~2.44ms through `ed25519-dalek`, against ~0.9ms of everything else in
+/// `verify_span` on a 2-header span over a 30-node set at threshold 30. The two
+/// agreeing is consistency rather than independent confirmation — the mock
+/// delegates to `near-crypto`, the same ed25519 family as `ed25519-dalek` — so
+/// this measures the Rust ed25519 path the contract's host function invokes,
+/// on this hardware. 2.4ms is high for ed25519; on a host with a SIMD backend
+/// the same span would read roughly 77/23 rather than 99/1. Treat those
+/// percentages as this host's, and the mandatory-`threshold` argument as the
+/// conclusion.
 fn check_quorum<C: Crypto>(
     crypto: &C,
     trust: &Trust,
