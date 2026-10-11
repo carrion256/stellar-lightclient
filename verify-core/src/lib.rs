@@ -41,8 +41,8 @@ mod outcomes;
 
 pub use journal::{decode_journal, encode_journal, EpochJournal};
 pub use outcomes::{
-    committed_soroban_hash, decode_result_set, outcome_digest, soroban_success_preimage,
-    tx_contents_hash, verify_outcome_claims,
+    committed_soroban_hash, decode_result_set, decode_result_set_hash_verified, outcome_digest,
+    soroban_success_preimage, tx_contents_hash, verify_outcome_claims,
 };
 
 /// Cryptographic primitives the verifier needs, supplied by the host: NEAR host
@@ -450,7 +450,7 @@ pub fn verify_span<C: Crypto>(
         if crypto.sha256(results_bytes) != pinned_result_hash {
             return Err(Error::TxSetResultHashMismatch);
         }
-        let results = outcomes::decode_result_set(results_bytes)?;
+        let results = outcomes::decode_result_set_hash_verified(results_bytes)?;
         outcome_digests = outcomes::verify_outcome_claims(
             crypto,
             trust.network_id,

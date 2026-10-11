@@ -43,17 +43,20 @@
 
 use stellar_xdr::{
     EnvelopeType, Hash, InnerTransactionResultResult, InvokeHostFunctionResult,
-    InvokeHostFunctionSuccessPreImage, OperationResult, OperationResultTr, TransactionEnvelope,
-    TransactionResult, TransactionResultPair, TransactionResultResult, TransactionResultSet, VecM,
-    WriteXdr,
+    InvokeHostFunctionSuccessPreImage, Limited, Limits, OperationResult, OperationResultTr,
+    TransactionEnvelope, TransactionResult, TransactionResultPair, TransactionResultResult,
+    TransactionResultSet, VecM, WriteXdr,
 };
 
 use super::{decode, encode, Crypto, Error};
 
-/// Append the canonical XDR of `value` to `out`.
+/// Append the canonical XDR of `value` straight into `out`.
+///
+/// Writing directly rather than through [`encode`] avoids a fresh `Vec` per
+/// piece — `tx_contents_hash` pushes three of them for every outcome claim.
 fn push_xdr<T: WriteXdr>(out: &mut Vec<u8>, value: &T) -> Result<(), Error> {
-    out.extend_from_slice(&encode(value)?);
-    Ok(())
+    let mut writer = Limited::new(&mut *out, Limits::none());
+    value.write_xdr(&mut writer).map_err(|_| Error::XdrEncode)
 }
 
 /// stellar-core `TransactionFrame::getContentsHash()` /
@@ -105,14 +108,32 @@ pub fn tx_contents_hash<C: Crypto>(
     Ok(crypto.sha256(&pre))
 }
 
-/// Decode the supplied [`TransactionResultSet`], requiring canonical XDR so
-/// [`outcome_digest`] is well defined.
+/// Decode the supplied [`TransactionResultSet`], requiring canonical XDR.
+///
+/// For bytes the caller has **not** hash-verified. On the verified path use
+/// [`decode_result_set_hash_verified`], which skips the canonicality re-encode.
 pub fn decode_result_set(bytes: &[u8]) -> Result<TransactionResultSet, Error> {
-    let set: TransactionResultSet = decode(bytes).map_err(|_| Error::InvalidResultSetXdr)?;
+    let set = decode_result_set_hash_verified(bytes)?;
     if encode(&set).map_or(true, |b| b != bytes) {
         return Err(Error::NonCanonicalResultSet);
     }
     Ok(set)
+}
+
+/// Decode a [`TransactionResultSet`] the caller has already checked against an
+/// authenticated `tx_set_result_hash`.
+///
+/// stellar-core computed that hash over the canonical encoding, so a hash match
+/// *is* a proof the bytes are exactly `encode(decode(bytes))`. The canonicality
+/// re-encode [`decode_result_set`] performs is therefore subsumed here — not
+/// skipped as a shortcut. That re-encode costs one full serialisation of the
+/// set, hundreds of rows on a real ledger, and is the dominant cost of the
+/// outcome path.
+///
+/// **Only** use this where the hash has been checked. For unverified bytes use
+/// [`decode_result_set`].
+pub fn decode_result_set_hash_verified(bytes: &[u8]) -> Result<TransactionResultSet, Error> {
+    decode(bytes).map_err(|_| Error::InvalidResultSetXdr)
 }
 
 /// `sha256` over the canonical [`TransactionResultPair`] XDR — what the epoch
@@ -151,10 +172,16 @@ pub fn verify_outcome_claims<C: Crypto>(
             return Err(Error::OutcomeTransactionHashMismatch { outcome });
         }
         let canonical = encode(&pair)?;
+        // Compare structurally, and narrow on the row hash first. A
+        // `TransactionResult` compare recurses into the operation list, so
+        // doing it for every row is still O(rows) work per claim even without
+        // the re-encoding; the hash filter is a 32-byte compare and leaves one
+        // row to examine in practice.
         let committed = results
             .results
             .iter()
-            .any(|row| encode(row).map_or(false, |b| b == canonical));
+            .filter(|row| row.transaction_hash.0 == want)
+            .any(|row| *row == pair);
         if !committed {
             return Err(Error::OutcomeNotInResults { outcome });
         }
