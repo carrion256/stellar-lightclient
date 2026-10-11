@@ -447,3 +447,48 @@ fn risc0_receipt_rejects_malformed_seals_without_trapping() {
     // and not a test that only ever sees `false`.
     assert!(call(&seal), "the genuine seal must still verify");
 }
+
+/// `control_root` and `bn254_control_id` are part of the statement, not
+/// decoration: both feed the five Groth16 public inputs. A receipt proven under
+/// one wrapper identity must not verify under another — that binding is what
+/// makes "this receipt came from RISC Zero release X" meaningful rather than
+/// "some RISC Zero receipt verifies".
+///
+/// Every other test in this file supplies the *correct* pair, so without this
+/// the two parameters were never exercised as anything but constants.
+#[test]
+fn risc0_receipt_binds_the_wrapper_identity() {
+    let env = Env::default();
+    let f = risc0_fixture();
+    let call = |control_root: [u8; 32], bn254_control_id: [u8; 32]| {
+        StellarVerifier::verify_risc0_receipt(
+            env.clone(),
+            BytesN::from_array(&env, &hex_bytes(&f["image_id"]).try_into().unwrap()),
+            Bytes::from_slice(&env, &hex_bytes(&f["journal"])),
+            Bytes::from_slice(&env, &hex_bytes(&f["seal"])),
+            BytesN::from_array(&env, &control_root),
+            BytesN::from_array(&env, &bn254_control_id),
+        )
+    };
+
+    let good_root: [u8; 32] = hex_bytes(&f["control_root"]).try_into().unwrap();
+    let good_id: [u8; 32] = hex_bytes(&f["bn254_control_id"]).try_into().unwrap();
+
+    // Positive control first: the genuine identity must verify, so the
+    // rejections below are rejections rather than an always-`false` entry point.
+    assert!(call(good_root, good_id), "the genuine wrapper identity must verify");
+
+    // Each parameter is individually bound to the proof.
+    let mut bad_root = good_root;
+    bad_root[0] ^= 0x01;
+    assert!(!call(bad_root, good_id), "control_root must be bound to the proof");
+
+    let mut bad_id = good_id;
+    bad_id[0] ^= 0x01;
+    assert!(!call(good_root, bad_id), "bn254_control_id must be bound to the proof");
+
+    // All-zero is not a wildcard or a default.
+    assert!(!call([0u8; 32], [0u8; 32]), "no implicit wrapper identity");
+    assert!(!call(good_root, [0u8; 32]), "zero control id is not a default");
+    assert!(!call([0u8; 32], good_id), "zero control root is not a default");
+}
