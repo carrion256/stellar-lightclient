@@ -630,32 +630,39 @@ fn tx_set_kind_prev(bytes: &[u8], expected: [u8; 32]) -> Result<SetKind, Error> 
 /// (`GeneralizedTransactionSet` after the union discriminant).
 fn parse_tx_set(bytes: &[u8]) -> Result<(SetKind, Hash, Vec<TransactionEnvelope>), Error> {
     if let Some(set) = try_decode::<GeneralizedTransactionSet>(bytes) {
-        if encode(&set)? == bytes {
-            let GeneralizedTransactionSet::V1(v1) = set;
-            let mut txs = Vec::new();
-            for phase in Vec::from(v1.phases) {
-                match phase {
-                    TransactionPhase::V0(components) => {
-                        for component in Vec::from(components) {
-                            let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
-                                component;
-                            txs.extend(Vec::from(component.txs));
-                        }
+        // No canonicality re-encode here. The caller hash-checks the raw bytes
+        // against the signed `txSetHash` right after this returns, and
+        // stellar-core computed that hash over the canonical encoding — so a
+        // hash match *is* a proof the bytes are `encode(decode(bytes))`. The
+        // check would otherwise cost a full re-serialisation of every
+        // transaction in the set (hundreds on a real ledger).
+        let GeneralizedTransactionSet::V1(v1) = set;
+        let mut txs = Vec::new();
+        for phase in Vec::from(v1.phases) {
+            match phase {
+                TransactionPhase::V0(components) => {
+                    for component in Vec::from(components) {
+                        let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
+                            component;
+                        txs.extend(Vec::from(component.txs));
                     }
-                    TransactionPhase::V1(component) => {
-                        // Parallel phase: stages of dependent-tx clusters, flattened in
-                        // serialization order so indices match the set as hashed.
-                        for stage in Vec::from(component.execution_stages) {
-                            for cluster in Vec::from(stage.0) {
-                                txs.extend(Vec::from(cluster.0));
-                            }
+                }
+                TransactionPhase::V1(component) => {
+                    // Parallel phase: stages of dependent-tx clusters, flattened in
+                    // serialization order so indices match the set as hashed.
+                    for stage in Vec::from(component.execution_stages) {
+                        for cluster in Vec::from(stage.0) {
+                            txs.extend(Vec::from(cluster.0));
                         }
                     }
                 }
             }
-            return Ok((SetKind::Generalized, v1.previous_ledger_hash, txs));
         }
+        return Ok((SetKind::Generalized, v1.previous_ledger_hash, txs));
     }
+    // Legacy sets keep the check: their hash is `sha256(prev || envelopes)`
+    // rather than a digest of the whole XDR, so it does not subsume
+    // canonicality the way the generalized hash does.
     let set: TransactionSet = decode(bytes).map_err(|_| Error::InvalidTxSetXdr)?;
     if encode(&set)? != bytes {
         return Err(Error::NonCanonicalTxSet);
