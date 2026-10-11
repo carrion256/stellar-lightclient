@@ -118,8 +118,12 @@ pub fn seal_to_proof(seal: &[u8]) -> Result<Proof, String> {
     // Fixed-size chunks read fallibly: a panic here would be a contract trap,
     // not a diagnostic, so panic-freedom must not rest on the length check
     // above staying where it is.
+    // `i` is 0..=7 at every call site, so plain arithmetic cannot overflow and
+    // that stays visible. `saturating_add` here would cap the end index and
+    // leave the multiply unchecked — worse than useless, because it reads like
+    // overflow safety the expression does not have.
     let e = |i: usize| -> Result<&[u8], String> {
-        seal.get(i * SCALAR_SIZE..i.saturating_add(1) * SCALAR_SIZE)
+        seal.get(i * SCALAR_SIZE..(i + 1) * SCALAR_SIZE)
             .ok_or_else(|| "seal: truncated field element".into())
     };
     Ok(Proof {

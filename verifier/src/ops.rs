@@ -76,3 +76,60 @@ impl ProofOps for NearOps {
         near_sdk::env::alt_bn128_pairing_check(&buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_ec::{AffineRepr, CurveGroup};
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::testing_env;
+
+    /// `ProofOps`'s empty-input obligation for the NEAR provider.
+    ///
+    /// An earlier version tried to prove the stronger "never touches the host"
+    /// by omitting `testing_env!`, relying on `near_sdk::env` panicking without
+    /// a mock chain. It does not: `alt_bn128_*` returns normally in this
+    /// configuration, so a clean return proves nothing about whether the host
+    /// was called. The control case that would have made it falsifiable — a
+    /// non-empty multiexp, which must touch the host — also returned without
+    /// panicking, which is how the premise failed.
+    ///
+    /// So this pins the observable, not the mechanism: empty input yields the
+    /// identity and `true`. The "no host call" half is enforced by construction
+    /// (both paths return before any `env::*`) and is not testable here.
+    #[test]
+    fn empty_input_normalizes_to_identity_and_true() {
+        testing_env!(VMContextBuilder::new().build());
+        assert_eq!(NearOps.g1_multiexp(&[], &[]), G1::identity());
+        assert!(NearOps.pairing_check(&[]));
+    }
+
+    /// A length-mismatched multiexp is a programming error, not malformed
+    /// input: it must panic rather than quietly return a wrong point.
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn multiexp_length_mismatch_panics() {
+        let _ = NearOps.g1_multiexp(&[G1::generator()], &[]);
+    }
+
+    /// Non-empty input does reach the host, so these need the mock chain — and
+    /// they confirm the provider does real curve arithmetic rather than being a
+    /// stub that would make every cross-backend comparison vacuous.
+    #[test]
+    fn multiexp_does_real_host_arithmetic() {
+        testing_env!(VMContextBuilder::new().build());
+        let g = G1::generator();
+        let got = NearOps.g1_multiexp(&[g, g], &[Fr::from(3u64), Fr::from(5u64)]);
+        assert_eq!(got, (g * Fr::from(8u64)).into_affine());
+    }
+
+    #[test]
+    fn pairing_check_does_real_host_arithmetic() {
+        testing_env!(VMContextBuilder::new().build());
+        let g1 = G1::generator();
+        let g2 = G2::generator();
+        // e(g1, g2) · e(g1, −g2) is the identity; e(g1, g2) alone is not.
+        assert!(NearOps.pairing_check(&[(g1, g2), (g1, -g2)]));
+        assert!(!NearOps.pairing_check(&[(g1, g2)]));
+    }
+}
