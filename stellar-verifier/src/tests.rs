@@ -123,11 +123,10 @@ fn groth16_fixture_verifies_on_the_soroban_host() {
     );
 }
 
-/// Provider-independent cross-check: the same fixture also verifies with
-/// groth16-core's pure-Rust ops, so a failure of the host test above is a
-/// Soroban-provider problem, not a fixture/core problem.
-#[test]
-fn fixture_verifies_with_native_ops() {
+/// The toy-circuit fixture decoded into the shared core's structured types.
+/// Both the native-parity test and the cross-backend equivalence test need
+/// exactly this, so it lives in one place.
+fn structured_fixture() -> (groth16_core::VerifyingKey, groth16_core::Proof, Vec<Fr>) {
     let f = groth16_fixture();
     let vk = groth16_core::VerifyingKey {
         alpha_g1: g1_of(&f["vk"]["alpha_g1"]),
@@ -152,6 +151,15 @@ fn fixture_verifies_with_native_ops() {
         .iter()
         .map(|x| parse_fr(&hex_bytes(x)))
         .collect();
+    (vk, proof, inputs)
+}
+
+/// Provider-independent cross-check: the same fixture also verifies with
+/// groth16-core's pure-Rust ops, so a failure of the host test above is a
+/// Soroban-provider problem, not a fixture/core problem.
+#[test]
+fn fixture_verifies_with_native_ops() {
+    let (vk, proof, inputs) = structured_fixture();
     assert!(verify(&NativeOps, &vk, &proof, &inputs));
 }
 
@@ -186,30 +194,7 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
     let vk_wire = wire_vk(&f);
     let proof_wire = wire_proof(&f["proof"]);
     let inputs_wire = wire_inputs(&f["public_inputs"]);
-
-    let vk = groth16_core::VerifyingKey {
-        alpha_g1: g1_of(&f["vk"]["alpha_g1"]),
-        beta_g2: g2_of(&f["vk"]["beta_g2"]),
-        gamma_g2: g2_of(&f["vk"]["gamma_g2"]),
-        delta_g2: g2_of(&f["vk"]["delta_g2"]),
-        ic: f["vk"]["gamma_abc_g1"]
-            .as_array()
-            .expect("ic list")
-            .iter()
-            .map(|p| g1_of(p))
-            .collect(),
-    };
-    let proof = groth16_core::Proof {
-        a: g1_of(&f["proof"]["a"]),
-        b: g2_of(&f["proof"]["b"]),
-        c: g1_of(&f["proof"]["c"]),
-    };
-    let inputs: Vec<Fr> = f["public_inputs"]
-        .as_array()
-        .expect("public inputs list")
-        .iter()
-        .map(|x| parse_fr(&hex_bytes(x)))
-        .collect();
+    let (vk, proof, inputs) = structured_fixture();
 
     // Cases must be well-formed on *both* paths. A bit-flipped proof is
     // off-curve and cannot be represented as an arkworks point at all, so it
@@ -250,8 +235,15 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
     head[..64].copy_from_slice(&tail[..64]);
     tail[..64].copy_from_slice(&a_block);
 
+    // Each case carries its *expected* verdict, so agreement alone cannot pass:
+    // two backends that both wrongly accept a negative would otherwise satisfy
+    // `via_host == via_native`. Cases must be well-formed on both paths — a
+    // bit-flipped proof coordinate is off-curve and cannot be an arkworks point
+    // at all, so it cannot be a cross-backend case. That one belongs to
+    // `tampered_wire_proof_returns_false_without_trapping`.
     let cases: Vec<(
         &str,
+        bool,                        // expected verdict on both paths
         &Vec<u8>,                    // vk wire for the host path
         &groth16_core::VerifyingKey, // vk for the native path
         &Vec<u8>,                    // proof wire for the host path
@@ -259,9 +251,10 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
         &[u8],                       // inputs wire for the host path
         &[Fr],                       // inputs for the native path
     )> = vec![
-        ("valid", &vk_wire, &vk, &proof_wire, &proof, &inputs_wire, &inputs),
+        ("valid", true, &vk_wire, &vk, &proof_wire, &proof, &inputs_wire, &inputs),
         (
             "wrong public input",
+            false,
             &vk_wire,
             &vk,
             &proof_wire,
@@ -271,6 +264,7 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
         ),
         (
             "corrupted verifying key",
+            false,
             &bad_vk_wire,
             &bad_vk,
             &proof_wire,
@@ -280,6 +274,7 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
         ),
         (
             "swapped A and C",
+            false,
             &vk_wire,
             &vk,
             &swapped_wire,
@@ -289,18 +284,17 @@ fn wire_path_and_native_reference_agree_on_every_verdict() {
         ),
     ];
 
-    for (name, vk_w, vk_c, proof_w, proof_c, in_w, native_inputs) in cases {
+    for (name, expected, vk_w, vk_c, proof_w, proof_c, in_w, native_inputs) in cases {
         let env = Env::default();
         let via_host = call_verify(&env, vk_w, proof_w, in_w);
         let via_native = groth16_core::groth16::verify(&NativeOps, vk_c, proof_c, native_inputs);
+        assert_eq!(via_host, expected, "host path got the wrong verdict for case: {name}");
+        assert_eq!(via_native, expected, "native path got the wrong verdict for case: {name}");
         assert_eq!(
             via_host, via_native,
             "wire path and native reference disagree on case: {name}"
         );
     }
-    // And pin that the positive case really is positive, so agreement is not
-    // two backends both returning false.
-    assert!(call_verify(&Env::default(), &vk_wire, &proof_wire, &inputs_wire));
 }
 
 /// A single flipped bit in a proof coordinate (off-curve) must come back
