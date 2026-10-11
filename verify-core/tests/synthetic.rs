@@ -719,8 +719,32 @@ fn journal_roundtrip_and_garbage() {
     bad.truncate(112);
     assert!(decode_journal(&bad).is_err());
 
-    // Shorter than the 112-byte header rejected.
+    // Shorter than the minimum journal rejected.
     assert!(decode_journal(&[0u8; 40]).is_err());
+}
+
+/// Panic-freedom across every length. `decode_journal` parses the caller's
+/// journal on the `verify_claim` path, so a panic is a contract trap rather
+/// than a diagnostic, and the length check at the top is a fast rejection, not
+/// the safety mechanism. Mirrors the sweep `risc0_verify.rs` runs over the
+/// other two untrusted-byte parsers — a boundary test would pass while an
+/// interior length still indexed out of range.
+#[test]
+fn journal_decoder_never_panics_on_any_length() {
+    for len in 0..=160 {
+        let _ = decode_journal(&vec![0xABu8; len]);
+    }
+    // And the exact shape is then content-checked, not length-panicking.
+    let ok = EpochJournal {
+        start_seq: 5,
+        start_hash: [1u8; 32],
+        end_seq: 9,
+        end_hash: [2u8; 32],
+        policy_digest: [5u8; 32],
+        claim_ids: vec![],
+        outcome_digests: vec![],
+    };
+    assert!(decode_journal(&encode_journal(&ok)).is_ok());
 }
 
 #[test]

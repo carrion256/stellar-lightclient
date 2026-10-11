@@ -52,8 +52,21 @@ pub struct EpochJournal {
 }
 
 const VERSION: u32 = 2;
+/// Named layout offsets. `decode_journal` derives every position from these, so
+/// the layout has one expression rather than a set of literals that must be
+/// kept in step with the constants by hand — the hazard that bit this format
+/// once already, when `claim_ids` moved and the cursor started at the wrong
+/// place. `encode_journal` appends in this order and the round-trip tests pin
+/// the two together.
+const OFF_VERSION: usize = 0;
+const OFF_START_SEQ: usize = OFF_VERSION + 4;
+const OFF_START_HASH: usize = OFF_START_SEQ + 4;
+const OFF_END_SEQ: usize = OFF_START_HASH + 32;
+const OFF_END_HASH: usize = OFF_END_SEQ + 4;
+const OFF_POLICY: usize = OFF_END_HASH + 32;
+const OFF_CLAIM_COUNT: usize = OFF_POLICY + 32;
 /// Fixed prefix through `claim_count`.
-const CLAIMS_OFFSET: usize = 112;
+const CLAIMS_OFFSET: usize = OFF_CLAIM_COUNT + 4;
 /// Smallest legal journal: the fixed prefix plus the `outcome_count` word.
 const V2_HEADER_LEN: usize = CLAIMS_OFFSET + 4;
 
@@ -106,28 +119,40 @@ fn read_ids(
     Ok(ids)
 }
 
+/// Read `N` bytes at `at` — `None` rather than a panic on any short read.
+///
+/// The journal is untrusted input (`verify_claim` decodes a caller-supplied
+/// one), and a panic here is a contract trap rather than a diagnostic, so
+/// panic-freedom must not rest on the length check staying where it is.
+fn chunk<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+    bytes.get(at..at.checked_add(N)?)?.try_into().ok()
+}
+
 pub fn decode_journal(bytes: &[u8]) -> Result<EpochJournal, Error> {
+    let short = || Error::MalformedJournal("input shorter than header");
     if bytes.len() < V2_HEADER_LEN {
-        return Err(Error::MalformedJournal("input shorter than header"));
+        return Err(short());
     }
-    let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let u32_at = |at: usize| -> Result<u32, Error> {
+        Ok(u32::from_le_bytes(chunk::<4>(bytes, at).ok_or_else(short)?))
+    };
+    let word_at = |at: usize| -> Result<[u8; 32], Error> {
+        chunk::<32>(bytes, at).ok_or_else(short)
+    };
+
+    let version = u32_at(OFF_VERSION)?;
     if version != VERSION {
         // v0 (version-less, 76-byte header) and v1 (112-byte header, no outcome
         // block) are both unsupported: the journal format changed incompatibly.
         return Err(Error::MalformedJournal("unsupported journal version"));
     }
-    let start_seq = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    let end_seq = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
-    let claim_count =
-        u32::from_le_bytes([bytes[108], bytes[109], bytes[110], bytes[111]]) as usize;
+    let start_seq = u32_at(OFF_START_SEQ)?;
+    let end_seq = u32_at(OFF_END_SEQ)?;
+    let claim_count = u32_at(OFF_CLAIM_COUNT)? as usize;
+
     let mut cursor = CLAIMS_OFFSET;
     let claim_ids = read_ids(bytes, &mut cursor, claim_count, "claim count exceeds remaining bytes")?;
-    if cursor + 4 > bytes.len() {
-        return Err(Error::MalformedJournal("missing outcome count"));
-    }
-    let outcome_count =
-        u32::from_le_bytes([bytes[cursor], bytes[cursor + 1], bytes[cursor + 2], bytes[cursor + 3]])
-            as usize;
+    let outcome_count = u32_at(cursor)? as usize;
     cursor += 4;
     let outcome_digests =
         read_ids(bytes, &mut cursor, outcome_count, "outcome count exceeds remaining bytes")?;
@@ -135,18 +160,12 @@ pub fn decode_journal(bytes: &[u8]) -> Result<EpochJournal, Error> {
         return Err(Error::MalformedJournal("trailing bytes after outcome digests"));
     }
 
-    let mut start_hash = [0u8; 32];
-    start_hash.copy_from_slice(&bytes[8..40]);
-    let mut end_hash = [0u8; 32];
-    end_hash.copy_from_slice(&bytes[44..76]);
-    let mut policy_digest = [0u8; 32];
-    policy_digest.copy_from_slice(&bytes[76..108]);
     Ok(EpochJournal {
         start_seq,
-        start_hash,
+        start_hash: word_at(OFF_START_HASH)?,
         end_seq,
-        end_hash,
-        policy_digest,
+        end_hash: word_at(OFF_END_HASH)?,
+        policy_digest: word_at(OFF_POLICY)?,
         claim_ids,
         outcome_digests,
     })
