@@ -27,12 +27,14 @@ use ark_bn254::Fq;
 use ark_ff::{BigInt, PrimeField};
 use groth16_core::ProofOps;
 
-pub use groth16_core::bn254::{Fr, G1, G2};
+pub use groth16_core::bn254::{Fr, G1, G2, G1_SIZE, G2_SIZE, SCALAR_SIZE};
 
-pub const SCALAR_SIZE: usize = 32;
-pub const G1_SIZE: usize = 2 * SCALAR_SIZE;
-pub const G2_SIZE: usize = 4 * SCALAR_SIZE;
+/// NEAR buffer framing: bytes per `(G1, scalar)` element of
+/// `alt_bn128_g1_multiexp` input. NEAR's alone — Soroban's `g1_msm` takes
+/// separate vectors and has no such element stride.
 pub const G1_MULTIEXP_ELEMENT_SIZE: usize = G1_SIZE + SCALAR_SIZE; // 96
+/// NEAR buffer framing: bytes per `(G1, G2)` element of
+/// `alt_bn128_pairing_check` input.
 pub const PAIRING_CHECK_ELEMENT_SIZE: usize = G1_SIZE + G2_SIZE; // 192
 
 /// Encode a base-field element as 32-byte little-endian, exactly the

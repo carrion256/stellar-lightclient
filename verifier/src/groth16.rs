@@ -66,6 +66,16 @@ pub(crate) fn verify_trusted_vk(vk: &VerifyingKey, proof: &Proof, public_inputs:
 }
 
 
+/// The same assertions as `groth16_core::groth16::tests`, deliberately, on a
+/// different backend. Those run through `NativeOps` (pure arkworks); these run
+/// through [`NearOps`] against the mocked NEAR host, which delegates
+/// `alt_bn128_*` to nearcore VMLogic and aborts on a malformed point exactly as
+/// the on-chain host does.
+///
+/// Same names, same expectations. If the two suites ever disagree, the two
+/// backends disagree on the shared equation — that is the bug, and the
+/// cross-backend equivalence tests are what localise it. Read the core suite for
+/// the verification equation; read this one for the NEAR adapter.
 #[cfg(test)]
 mod tests {
     use super::*;

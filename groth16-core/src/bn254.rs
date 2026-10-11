@@ -21,6 +21,23 @@ pub type G1 = ark_bn254::G1Affine;
 /// BN254 G2 affine point (`ark_bn254::G2Affine`).
 pub type G2 = ark_bn254::G2Affine;
 
+/// Bytes in one BN254 field element.
+///
+/// These three describe the **point and seal layout**, which is shared: a
+/// Groth16 seal is `a(G1) ‖ b(G2) ‖ c(G1)` = 256 bytes on every chain, and
+/// [`crate::risc0`] parses exactly that. They live here rather than in a
+/// provider for that reason. What does *not* belong here is any chain's buffer
+/// framing — NEAR packs `[(G1, scalar)]` and `[(G1, G2)]` batches whose
+/// element sizes are NEAR's alone, and those stay in `verifier/src/bn128.rs`.
+pub const SCALAR_SIZE: usize = 32;
+/// Bytes in one uncompressed G1 point: two field elements.
+pub const G1_SIZE: usize = 2 * SCALAR_SIZE;
+/// Bytes in one uncompressed G2 point: four field elements.
+pub const G2_SIZE: usize = 4 * SCALAR_SIZE;
+/// Bytes in a Groth16 seal: `a(G1) ‖ b(G2) ‖ c(G1)`. This is the RISC Zero
+/// `Seal::SIZE` and the wire length of any Groth16 proof in this format.
+pub const SEAL_SIZE: usize = G1_SIZE + G2_SIZE + G1_SIZE;
+
 /// Pure-Rust [`ProofOps`] provider: `sha2` for SHA-256 and arkworks
 /// ([`VariableBaseMSM`] / [`Pairing`]) for the curve operations — no chain
 /// host involved. This is what this crate's own tests run through, and any

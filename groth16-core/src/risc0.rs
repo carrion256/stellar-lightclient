@@ -8,7 +8,7 @@
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use crate::bn254::{Fr, G1, G2};
+use crate::bn254::{Fr, G1, G2, SCALAR_SIZE, SEAL_SIZE};
 use crate::groth16::{self, Proof, VerifyingKey};
 use crate::ops::ProofOps;
 use ark_bn254::Fq;
@@ -104,13 +104,18 @@ pub fn verify(ops: &impl ProofOps, proof: &Proof, public_inputs: &[Fr; 5]) -> bo
 ///   src/types.rs:117-120). We un-swap here so `Proof.b` is the real G2 point.
 /// - `c`: bytes 192..256, G1 as `(x_BE, y_BE)`.
 pub fn seal_to_proof(seal: &[u8]) -> Result<Proof, String> {
-    // Seal::SIZE == 256; the source returns an error, so do the same.
-    if seal.len() != 256 {
-        return Err(format!("invalid seal length: expected 256, got {}", seal.len()));
+    // `Seal::SIZE` is `a(G1) ‖ b(G2) ‖ c(G1)`; the source returns an error on a
+    // wrong length, so do the same. Sizes come from the shared layout rather
+    // than magic numbers, so this and the encoders cannot drift apart.
+    if seal.len() != SEAL_SIZE {
+        return Err(format!(
+            "invalid seal length: expected {SEAL_SIZE}, got {}",
+            seal.len()
+        ));
     }
     // Split into 32-byte big-endian field elements exactly as Seal::decode does
     // (types.rs:80-100): a = [e0, e1], b = [[e2, e3], [e4, e5]], c = [e6, e7].
-    let e = |i: usize| &seal[i * 32..(i + 1) * 32];
+    let e = |i: usize| &seal[i * SCALAR_SIZE..(i + 1) * SCALAR_SIZE];
     Ok(Proof {
         a: g1_from_be_raw([e(0), e(1)]).map_err(|_| "seal a: invalid G1 point")?,
         b: g2_from_be_raw([[e(2), e(3)], [e(4), e(5)]])
