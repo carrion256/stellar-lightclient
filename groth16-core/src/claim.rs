@@ -43,6 +43,7 @@ use crate::ops::ProofOps;
 /// Exit code is split into the `sys_exit`/`user_exit` pair exactly as
 /// `ExitCode::into_pair()` defines it (`risc0-binfmt-3.0.5/src/exit_code.rs:65-72`):
 /// `Halted(u) = (0, u)`, `Paused(u) = (1, u)`, `SystemSplit = (2, 0)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiptClaim {
     /// The `SystemState` digest just before execution (for `ok()` claims: the
     /// image ID). Upstream field `pre` (receipt.rs:59).
@@ -173,5 +174,93 @@ pub fn ok_claim(ops: &impl ProofOps, image_id: [u8; 32], journal: &[u8]) -> Rece
         sys_exit: 0,
         user_exit: 0,
         output: Some(ok_output_digest(ops, journal)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bn254::NativeOps;
+
+    fn claim(output: Option<[u8; 32]>) -> ReceiptClaim {
+        ReceiptClaim {
+            pre: [1u8; 32],
+            post: [2u8; 32],
+            output,
+            sys_exit: 3,
+            user_exit: 4,
+        }
+    }
+
+    /// `decode` is documented as the inverse of `encode`. Pin it, including the
+    /// `output: None` case where the inverse is up to the pruned rule below.
+    #[test]
+    fn encode_decode_round_trips() {
+        for c in [claim(Some([9u8; 32])), claim(None)] {
+            let wire = c.encode();
+            assert_eq!(wire.len(), 104, "frozen upstream field set is 104 bytes");
+            let back = ReceiptClaim::decode(&wire).expect("well-formed claim decodes");
+            assert_eq!(back, c);
+        }
+    }
+
+    /// The pruned rule: upstream represents "no output" as an absent digest
+    /// (`hash.rs:57-64`), which encodes as all-zero — and a real digest that
+    /// happened to be all-zero is cryptographically unreachable. So `None` and
+    /// `Some([0; 32])` are the *same* wire form and the *same* digest. That
+    /// equivalence is what lets `decode` map zeros back to `None` without
+    /// changing any verification outcome, so it is worth pinning rather than
+    /// leaving to the two `unwrap_or(ZERO)` call sites to agree by inspection.
+    #[test]
+    fn pruned_output_is_wire_and_digest_equivalent() {
+        let none = claim(None);
+        let zeros = claim(Some([0u8; 32]));
+
+        assert_eq!(none.encode(), zeros.encode(), "same bytes on the wire");
+        assert_eq!(
+            claim_digest(&NativeOps, &none),
+            claim_digest(&NativeOps, &zeros),
+            "same digest — verification must not tell them apart"
+        );
+        // And decode maps that shared form back to `None`.
+        assert_eq!(ReceiptClaim::decode(&none.encode()).unwrap().output, None);
+    }
+
+    /// Any other output digest must be distinguishable — otherwise the
+    /// equivalence above would be a collision, not a rule.
+    #[test]
+    fn non_zero_output_changes_the_digest() {
+        let none = claim(None);
+        let one = claim(Some([1u8; 32]));
+        assert_ne!(none.encode(), one.encode());
+        assert_ne!(
+            claim_digest(&NativeOps, &none),
+            claim_digest(&NativeOps, &one)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_wrong_lengths() {
+        assert!(ReceiptClaim::decode(&[]).is_err());
+        assert!(ReceiptClaim::decode(&[0u8; 103]).is_err());
+        assert!(ReceiptClaim::decode(&[0u8; 105]).is_err());
+    }
+
+    /// The digest is what the Groth16 public input binds, so the journal must
+    /// actually reach it.
+    #[test]
+    fn ok_claim_digest_binds_the_journal() {
+        let a = ok_claim(&NativeOps, [7u8; 32], b"journal a");
+        let b = ok_claim(&NativeOps, [7u8; 32], b"journal b");
+        assert_ne!(
+            claim_digest(&NativeOps, &a),
+            claim_digest(&NativeOps, &b),
+            "different journals must produce different claim digests"
+        );
+        assert_eq!(
+            claim_digest(&NativeOps, &ok_claim(&NativeOps, [7u8; 32], b"journal a")),
+            claim_digest(&NativeOps, &a),
+            "and the same journal must produce the same one"
+        );
     }
 }
