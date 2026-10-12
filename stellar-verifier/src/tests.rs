@@ -121,6 +121,15 @@ fn groth16_fixture_verifies_on_the_soroban_host() {
         call_verify(&env, &wire_vk(&f), &wire_proof(&f["proof"]), &wire_inputs(&f["public_inputs"])),
         "valid fixture proof must verify on the Soroban host"
     );
+    // The one cost figure never recorded for this contract. Soroban meters
+    // cpu instructions and memory separately from the NEAR runtime, so this
+    // is not comparable to `submit_span`'s Tgas — it is its own axis.
+    let b = env.budget();
+    println!(
+        "soroban verify: {} cpu insns, {} mem bytes",
+        b.cpu_instruction_cost(),
+        b.memory_bytes_cost(),
+    );
 }
 
 /// The toy-circuit fixture decoded into the shared core's structured types.
