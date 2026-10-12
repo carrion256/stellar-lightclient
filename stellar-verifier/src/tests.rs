@@ -121,9 +121,10 @@ fn groth16_fixture_verifies_on_the_soroban_host() {
         call_verify(&env, &wire_vk(&f), &wire_proof(&f["proof"]), &wire_inputs(&f["public_inputs"])),
         "valid fixture proof must verify on the Soroban host"
     );
-    // The one cost figure never recorded for this contract. Soroban meters
-    // cpu instructions and memory separately from the NEAR runtime, so this
-    // is not comparable to `submit_span`'s Tgas — it is its own axis.
+    // The toy Groth16 circuit's cost. The real RISC Zero receipt is measured
+    // separately in `risc0_receipt_verifies_end_to_end` — different program,
+    // different number. Soroban meters cpu insns and memory separately from
+    // NEAR's gas, so neither figure is comparable to `submit_span`'s Tgas.
     let b = env.budget();
     println!(
         "soroban verify: {} cpu insns, {} mem bytes",
@@ -403,6 +404,14 @@ fn risc0_receipt_verifies_end_to_end() {
         BytesN::from_array(&env, &hex_bytes(&f["bn254_control_id"]).try_into().unwrap()),
     );
     assert!(result, "upstream RISC Zero receipt must verify");
+    // The real RISC Zero receipt's cost — not the toy Groth16 circuit's, which
+    // is a different number and a different program.
+    let b = env.budget();
+    println!(
+        "soroban verify_risc0_receipt: {} cpu insns, {} mem bytes",
+        b.cpu_instruction_cost(),
+        b.memory_bytes_cost(),
+    );
 }
 
 /// A receipt with a different journal must be rejected (the claim digest
