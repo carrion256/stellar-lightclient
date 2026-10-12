@@ -14,18 +14,29 @@ Measured on the Soroban host, per verification:
 The receipt figure is the one to quote; the toy circuit is a different program
 and only exercises the arithmetic.
 
+Deploy size: the Soroban wasm is **54,716 bytes**, built for size
+(`opt-level = "z"`) in its own workspace so the repository's gas-oriented
+profile does not reach it. At `opt-level = 3` the same source is 124,463 bytes.
+The network's contract-size setting is on-ledger and validator-voted, so it can
+change; the value in stellar-core's testnet settings file is 131,072 bytes
+(128 KiB), which leaves roughly 76 KB of headroom. That is a testnet file, not a
+mainnet reading — confirm the live value with `sorobaninfo` before relying on it.
+
 Its trust model differs from the NEAR contract's and that is deliberate:
 `control_root` and `bn254_control_id` are **caller arguments, not stored pins**,
 because both feed the Groth16 public inputs — they are part of the statement
 being proven, so a wrong value fails to verify rather than widening what is
-accepted. The consequence is that the contract supplies **no reference values**:
-a consumer wanting "this receipt came from RISC Zero release X" must pin both
-against X at integration time. There is therefore no stored wrapper identity to
-rotate and no stranding risk; the NEAR deployment keeps `get_wrapper` /
-`is_wrapper_compatible` because it *does* store one.
+accepted. The consequence is that the contract **stores no reference values**:
+a consumer wanting "this receipt came from RISC Zero release X" must compare
+both against X at integration time. `groth16_core::risc0` names the pair to
+compare against (`RISC0_CONTROL_ROOT`, `RISC0_BN254_CONTROL_ID`). There is
+therefore no stored wrapper identity to rotate and no stranding risk; the NEAR
+deployment keeps `get_wrapper` / `is_wrapper_compatible` because it *does* store
+one.
 
-One acceptance criterion below remains open: the seal-build check confirming a
-freshly built seal's `bn254_control_id` matches the pinned value.
+Two acceptance criteria below remain open: the seal-build check confirming a
+freshly built seal's `bn254_control_id` matches the pinned value, and the
+comparison of Soroban's cost to the NEAR baseline.
 
 ## Problem
 
