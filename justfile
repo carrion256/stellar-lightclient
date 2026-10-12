@@ -81,12 +81,18 @@ guest-native:
 
 # ── test ─────────────────────────────────────────────────────────────────────
 
-# Full gate: wasm first, then workspace, guest, and relayer suites.
-test: wasm test-workspace test-guest test-relay
+# Full gate: wasm first, then workspace, Soroban, guest, and relayer suites.
+test: wasm test-workspace test-soroban test-guest test-relay
 
 # Workspace tests including the NEAR sandbox e2e (build `just wasm` first).
 test-workspace:
     cargo test --workspace
+
+# Soroban verifier tests. `stellar-verifier` is its own workspace so it can build
+# for size while the NEAR contract builds for gas, which means `--workspace` no
+# longer covers it and it needs its own recipe.
+test-soroban:
+    cargo test --manifest-path stellar-verifier/Cargo.toml
 
 # Guest crate tests (own workspace and lockfile, native target).
 test-guest:
@@ -121,8 +127,9 @@ calldata-json contract='lc.testnet':
 # ── maintenance ──────────────────────────────────────────────────────────────
 
 # Remove build output and generated calldata (keeps testdata fixtures).
+# `stellar-verifier/target` is its own workspace's cache and is easy to miss.
 clean:
-    rm -rf target target-contract target-xtask target-fixture guest/target
+    rm -rf target target-* guest/target stellar-verifier/target
     rm -f /tmp/span.borsh /tmp/stellar-fixture.json
 
 # Show uncommitted work before handing the tree to someone else.
