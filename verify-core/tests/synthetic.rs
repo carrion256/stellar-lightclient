@@ -805,11 +805,17 @@ fn hostile_scp_value_length_fails_closed_without_allocating() {
     // ScpValue is an unbounded BytesM: with `Limits::none` a 68-byte envelope
     // declaring a 4 GiB value would abort the process before verification.
     // Bounded decoding returns InvalidEnvelopeXdr instead.
+    //
+    // The pledge discriminant is `ScpStatementType`: Prepare=0, Confirm=1,
+    // Externalize=2, Nominate=3. This used to write 3, which is Nominate — so
+    // the hostile length sat in a pledge `check_quorum` skips and the test
+    // never reached the read it is named for. 2 puts it in the `Value` the
+    // externalize path actually reads.
     let mut raw = Vec::new();
     raw.extend_from_slice(&0i32.to_be_bytes()); // PublicKeyTypeEd25519
     raw.extend_from_slice(&[0u8; 32]); // node id
     raw.extend_from_slice(&12u64.to_be_bytes()); // slot index
-    raw.extend_from_slice(&3i32.to_be_bytes()); // EXTERNALIZE
+    raw.extend_from_slice(&2i32.to_be_bytes()); // EXTERNALIZE
     raw.extend_from_slice(&1u32.to_be_bytes()); // ballot counter
     raw.extend_from_slice(&0xffff_fffcu32.to_be_bytes()); // declared value length
     let c = chain(11, [5u8; 32], 12, SetKind::Generalized);

@@ -575,12 +575,11 @@ fn check_quorum<C: Crypto>(
 
         let signature = signature_bytes(&envelope.signature).ok_or(Error::InvalidSignatureLength { index })?;
         // `ScpEnvelope` is `ScpStatement` followed by `Signature`, and
-        // `Signature` is `opaque<64>` — a 4-byte length plus the 64 bytes
-        // checked just above. So the statement's XDR is already the prefix of
-        // `raw`, and those are precisely the bytes stellar-core signed. Using
-        // them beats re-serialising `statement` per verified signature, and is
-        // stricter: a non-canonical encoding of a statement no longer verifies
-        // against a signature over its canonical form.
+        // `Signature` is `opaque<64>` — a u32 length plus those 64 bytes. So
+        // the statement's XDR is the prefix of `raw`, and those are precisely
+        // the bytes stellar-core signed. This is stricter than re-serialising
+        // `statement`: a non-canonical encoding no longer verifies against a
+        // signature over its canonical form.
         let statement_len = raw
             .len()
             .checked_sub(68)
@@ -593,7 +592,6 @@ fn check_quorum<C: Crypto>(
         if !crypto.ed25519_verify(&signature, &message, &node_id) {
             return Err(Error::InvalidValidatorSignature { index });
         }
-
         counted.push(node_id);
         if counted.len() as u32 >= trust.threshold {
             break;
