@@ -308,14 +308,13 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
 /// many. Its share therefore moves with claim density, and the benefit of a
 /// cheaper parse is per span, not per claim.
 ///
-/// What that 16.9% is *not*: it is not "the largest unaccelerated term". The
-/// 60.7M with no claims contains generic rv32im work too — bincode
-/// deserialisation of an `EpochInput` carrying both sets and all 30 envelopes,
-/// plus the XDR decode of those envelopes and headers per span. None of that is
-/// attributed yet, and if the input decode turns out to dominate, the lever is
-/// the input format rather than a parsing walk. The one-span figure bounds the
-/// one-off input cost at well under 1M cycles, which argues against that — but
-/// it is an inference from two numbers, not a direct measurement.
+/// What that 16.9% is *not*: it is not "the largest unaccelerated term". Other
+/// generic rv32im work is present in the same spans — the XDR decode of 30
+/// envelopes and 2 headers per span, plus bincode deserialisation of an
+/// `EpochInput` carrying both sets — and none of that is individually
+/// attributed. The one-span figure bounds the one-off input cost at well under
+/// 1M cycles, which argues against bincode being the lever, but that is an
+/// inference from two numbers, not a direct measurement.
 ///
 /// Also measured: whether the precompile swap does anything at all. Same ELF
 /// build procedure, same input, twice — once with RISC Zero's accelerated
@@ -333,10 +332,31 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
 /// apples-to-apples. The 3.4-3.9x on the epoch as a whole is the evidence for
 /// the `perf(guest)` commit.
 ///
-/// What that also says: the accelerated build still spends ~30M cycles per span
-/// on work that is not `parse_tx_set`, and only part of it is crypto. Splitting
-/// that remainder is the next question — not whether the precompiles work,
-/// which they do.
+/// One confound to keep in mind when quoting that ratio: it is not purely the
+/// precompile. The RISC Zero fork resolves `ed25519-dalek` 2.1.1 while
+/// crates.io gives 2.2.0, so the delta bundles a version change with the
+/// acceleration. The order of magnitude is not in doubt — 3.4x is not a patch
+/// release — but the exact factor is not attributable to the precompile alone.
+///
+/// The accelerated backend is selected by `cfg(target_os = "zkvm")`, not by a
+/// feature flag (`curve25519-dalek`'s features are `alloc`,
+/// `precomputed-tables`, `zeroize`; there is no `risc0` feature), and
+/// `crypto-bigint`'s zkvm-only dependency is what the `[patch.crates-io]` entry
+/// supplies. So it engages automatically for `riscv32im-risc0-zkvm-elf` — if a
+/// future A/B comes back flat, the cause is not a missing flag but that
+/// `ed25519-dalek`'s verify path has stopped routing through the accelerated
+/// ops. Check the call site, not the manifest.
+///
+/// What that leaves open: the split of the 60.7M on the accelerated build. The
+/// A/B bounds the *saving* — crypto acceleration removed 173M of the 233.9M
+/// unaccelerated cost — but it does not split what remains, which is
+/// `non-crypto + accelerated-crypto` and only `parse_tx_set` is individually
+/// attributed. Non-crypto work is present and identical across both builds
+/// (XDR decode of 30 envelopes and 2 headers per span, bincode input decode),
+/// which is precisely why `parse_tx_set` did not move; but whether the 60.7M is
+/// mostly the remaining accelerated crypto or mostly that generic work is not
+/// something these numbers answer. Do not read the 3.4x as "crypto is now
+/// cheap" — read it as "the saving is 173M cycles".
 #[test]
 #[ignore]
 fn zkvm_cycle_breakdown() {
