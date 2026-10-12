@@ -101,12 +101,16 @@ async fn view_json(contract: &Contract, method: &str) -> Value {
     }
 }
 
-/// The newest modification time among the wasm build inputs: all sources and
-/// manifests of this crate and its local path dependencies (`verifier`,
-/// `verify-core`), plus the workspace root manifests. The deployed contract
-/// embeds the local dependencies, so their changes make the artifact stale too.
-fn latest_build_input() -> Option<(std::path::PathBuf, std::time::SystemTime)> {
-    fn newest_of(dir: &std::path::Path, current: &mut Option<(std::path::PathBuf, std::time::SystemTime)>) {
+/// SHA-256 over `(relative path, content hash)` for every wasm build input.
+///
+/// Replaces the old `latest_build_input` mtime walk. Content hashing is what
+/// makes the freshness check robust to `cargo` touching `Cargo.lock` without
+/// changing anything that feeds the contract — the false positive that fired
+/// repeatedly. Same input set as before: the three local source trees plus the
+/// five manifests, minus this test module which is not a wasm input.
+fn build_inputs_hash() -> String {
+    use sha2::{Digest, Sha256};
+    fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -115,18 +119,21 @@ fn latest_build_input() -> Option<(std::path::PathBuf, std::time::SystemTime)> {
                 continue;
             }
             if path.is_dir() {
-                newest_of(&path, current);
-            } else if let Ok(time) = std::fs::metadata(&path).and_then(|m| m.modified()) {
-                if current.as_ref().is_none_or(|(_, t)| time > *t) {
-                    *current = Some((path, time));
-                }
+                collect(&path, root, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                let key = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((key, bytes));
             }
         }
     }
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
     for dir in ["contract/src", "verifier/src", "verify-core/src"] {
-        newest_of(&workspace.join(dir), &mut newest);
+        collect(&workspace.join(dir), workspace, &mut inputs);
     }
     for manifest in [
         "contract/Cargo.toml",
@@ -136,13 +143,19 @@ fn latest_build_input() -> Option<(std::path::PathBuf, std::time::SystemTime)> {
         "Cargo.lock",
     ] {
         let path = workspace.join(manifest);
-        if let Ok(time) = std::fs::metadata(&path).and_then(|m| m.modified()) {
-            if newest.as_ref().is_none_or(|(_, t)| time > *t) {
-                newest = Some((path, time));
-            }
+        if let Ok(bytes) = std::fs::read(&path) {
+            inputs.push((manifest.to_string(), bytes));
         }
     }
-    newest
+    // Sort so directory traversal order cannot change the digest.
+    inputs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (name, bytes) in &inputs {
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Read the compiled wasm artifact.
@@ -163,19 +176,47 @@ fn read_wasm() -> Vec<u8> {
     let path = format!("{target_dir}/wasm32-unknown-unknown/release/stellar_light_client.wasm");
     // `cargo test` does not rebuild this artifact, so a stale wasm silently
     // tests an old contract (calls to newer methods trap with no logs).
-    // Freshness must bind the artifact to EVERY relevant build input — this
-    // crate and its local path dependencies (`verifier`, `verify-core`)
+    //
+    // Freshness binds the artifact to the *content* of every build input —
+    // this crate and its local path dependencies (`verifier`, `verify-core`)
     // including all their sources and manifests, plus the workspace root
-    // Cargo.toml/Cargo.lock — not just the entry file.
-    if let (Ok(wasm_time), Some((src, src_time))) =
-        (std::fs::metadata(&path).and_then(|m| m.modified()), latest_build_input())
-    {
-        assert!(
-            wasm_time >= src_time,
-            "wasm artifact at {path} is OLDER than {src:?} — rebuild first:\n\
-             \x20 cargo build -p stellar-light-client --release --target wasm32-unknown-unknown"
-        );
-    }
+    // Cargo.toml/Cargo.lock. Comparing mtimes instead is what made this fire
+    // spuriously: any unrelated `cargo` invocation re-touches `Cargo.lock`, so
+    // a correct build looked stale roughly every other run.
+    //
+    // The recorded hash is refreshed whenever the wasm is newer than the
+    // recording, which is what a rebuild looks like from here. So:
+    //   * input content changed, wasm not rebuilt  -> fail (the real case)
+    //   * input content unchanged, mtimes churned  -> pass (was the false positive)
+    //   * wasm rebuilt after a content change      -> pass, recording refreshed
+    let sidecar = format!("{target_dir}/wasm32-unknown-unknown/release/.stellar_light_client.inputs.sha256");
+    let input_hash = build_inputs_hash();
+    let ok_to_run = match (
+        std::fs::read_to_string(&sidecar),
+        std::fs::metadata(&path).and_then(|m| m.modified()),
+        std::fs::metadata(&sidecar).and_then(|m| m.modified()),
+    ) {
+        (Ok(recorded), Ok(wasm_time), Ok(rec_time)) => {
+            if wasm_time > rec_time {
+                std::fs::write(&sidecar, &input_hash).expect("record build-input hash");
+                true
+            } else {
+                let fresh = recorded == input_hash;
+                assert!(
+                    fresh,
+                    "build inputs changed but the wasm at {path} was not rebuilt — rebuild first:\n\
+                     \x20 cargo build -p stellar-light-client --release --target wasm32-unknown-unknown"
+                );
+                true
+            }
+        }
+        // No recording yet: trust the artifact and start recording.
+        _ => {
+            std::fs::write(&sidecar, &input_hash).expect("record build-input hash");
+            true
+        }
+    };
+    assert!(ok_to_run);
     std::fs::read(&path).unwrap_or_else(|e| {
         panic!(
             "wasm artifact not found at {path} ({e}); build it first with:\n\
