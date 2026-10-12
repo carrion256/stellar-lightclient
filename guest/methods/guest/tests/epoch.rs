@@ -283,16 +283,43 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
     assert!(guest::run_epoch_bytes(&oversized).is_err());
 }
 
-/// Execute the built guest ELF in the zkVM and report the cycle breakdown.
-/// Execution only — no proving.
+/// Execute the built guest ELF in the zkVM and report the cycle breakdown, and
+/// assert the accelerated and fallback paths compute the same journal.
 ///
 /// Requires the ELF at `target/riscv32im-risc0-zkvm-elf/release/guest`; build it
 /// first with the rustup/risc0 toolchain command in AGENTS.md. `#[ignore]`d so
-/// the default suite does not depend on that artifact.
+/// the default suite does not depend on that artifact. Needs `r0vm` on PATH —
+/// `nix shell nixpkgs#cargo-risczero` provides it; the `risc0` rustup toolchain
+/// does not.
 ///
-/// Run with `RISC0_INFO=1` for the precompile-usage breakdown — that is the
-/// number that says whether `ed25519`/`sha256` are reaching the accelerated
-/// circuits and where the remaining cycles go.
+/// # Measured baseline
+///
+/// Real fixture epoch (2 spans, 30 envelopes at threshold 30, 319 KB set):
+///
+/// ```text
+/// 2 spans, 1 claim     73,097,352 cycles  (~80 segments)
+/// 2 spans, no claims   60,730,164
+/// 1 span,  no claim    30,589,574
+///   -> parse_tx_set    12,367,188   16.9% of total, 29% of the span carrying it
+/// ```
+///
+/// `parse_tx_set` is a **per-span constant**: it decodes every transaction in
+/// the set to serve any claim, so ~12.4M is paid whether there is one claim or
+/// many. Its share therefore moves with claim density, and the benefit of a
+/// cheaper parse is per span, not per claim.
+///
+/// What that 16.9% is *not*: it is not "the largest unaccelerated term". The
+/// 60.7M with no claims contains generic rv32im work too — bincode
+/// deserialisation of an `EpochInput` carrying both sets and all 30 envelopes,
+/// plus the XDR decode of those envelopes and headers per span. None of that is
+/// attributed yet, and if the input decode turns out to dominate, the lever is
+/// the input format rather than a parsing walk. The one-span figure bounds the
+/// one-off input cost at well under 1M cycles, which argues against that — but
+/// it is an inference from two numbers, not a direct measurement.
+///
+/// Also unmeasured: the precompile win itself. Comparing against a build with
+/// crates.io `sha2`/`ed25519-dalek` is the only way to support or withdraw the
+/// `perf(guest)` claim.
 #[test]
 #[ignore]
 fn zkvm_cycle_breakdown() {
@@ -324,7 +351,17 @@ fn zkvm_cycle_breakdown() {
             .build()
             .unwrap();
         let session = default_executor().execute(env, &encoded).unwrap();
-        decode_journal(&session.journal.bytes).expect("guest journal must decode");
+        // The swap to RISC Zero's precompile forks must not change what the
+        // guest computes. `run_epoch_bytes` uses the same code natively, where
+        // those crates fall back to the generic implementations, so identical
+        // journals are the proof that the accelerated and fallback paths agree
+        // — in the environment that actually gets proven, which is the one the
+        // native suite cannot see.
+        let native = guest::run_epoch_bytes(&payload).expect("native run");
+        assert_eq!(
+            native, session.journal.bytes,
+            "zkVM and native journals must be byte-identical"
+        );
         session.segments.iter().map(|s| s.cycles as u64).sum()
     };
 
@@ -333,13 +370,30 @@ fn zkvm_cycle_breakdown() {
     for span in &mut no_claims.spans {
         span.claims.clear();
     }
+    // One span instead of two separates the per-span cost (signatures, set
+    // hash, tx-set parse) from what is paid once — chiefly bincode
+    // deserialisation of the input, which itself grows with the input, so the
+    // split is approximate rather than exact.
+    let mut one_span = epoch_input(&fixture());
+    one_span.spans.truncate(1);
 
     let with_claims = run(&full);
     let without = run(&no_claims);
+    let single = run(&one_span);
+    // Fixture asymmetry to keep in mind: span 0 carries no inclusion claim and
+    // span 1 carries one, so "1 span" and "marginal 2nd span" are not like for
+    // like. What is comparable:
+    //   span 1 with claims    = with_claims - single
+    //   span 1 without claims = without - single
+    // and their difference is the parse, which is also what
+    // with_claims - without measures directly.
     eprintln!(
-        "zkvm cycles: full epoch {with_claims} across 80 segments\n  without claims: {without}\n  -> parse_tx_set: {} ({:.1}% of total)",
+        "zkvm cycles (80 segments for the full epoch):\n  2 spans, 1 claim:     {with_claims}\n  2 spans, no claims:   {without}\n  1 span,  (no claim):  {single}\n  -> parse_tx_set:      {} ({:.1}% of total; {:.0}% of the span carrying the claim)\n  -> second span cost:  {} (incl. its parse)\n  -> input + first span: {single}",
         with_claims.saturating_sub(without),
-        100.0 * (with_claims.saturating_sub(without)) as f64 / with_claims as f64
+        100.0 * (with_claims.saturating_sub(without)) as f64 / with_claims as f64,
+        100.0 * (with_claims.saturating_sub(without)) as f64
+            / (with_claims.saturating_sub(single)) as f64,
+        with_claims.saturating_sub(single)
     );
 }
 

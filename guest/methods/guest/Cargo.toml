@@ -29,15 +29,15 @@ bincode = "1"
 # transcribed from: a guest proven with the 5.x toolchain produces a different
 # bn254_control_id and the contract's wrapper pinning rejects the receipt.
 # Guest and verifier MUST be the same RISC Zero release.
-risc0-zkvm = { version = "3.0.5", optional = true }
+risc0-zkvm = { version = "~3.0.5", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
 base64 = "0.22"
 # For `tests/zkvm_cycles.rs`: execute the built ELF in the zkVM and report the
 # cycle breakdown. Execution only — no proving.
-risc0-zkvm = { version = "3.0.5", features = ["std"] }
-risc0-binfmt = "3.0.5"
+risc0-zkvm = { version = "~3.0.5", features = ["std"] }
+risc0-binfmt = "~3.0.5"
 # The V1COMPAT kernel the user ELF must be packaged with before execution.
 # Versioned independently of `risc0-zkvm`; 2.2.3 is what the zkvm 3.x line pulls.
 risc0-zkos-v1compat = "2.2.3"
