@@ -12,6 +12,9 @@ Two encodings:
   --format json   JSON + base64 args for `submit_span` (explorer/wallet friendly)
   --format borsh  raw Borsh call bytes for `submit_span_raw` (no base64: ~27% smaller)
 
+`borsh` is the default. This changed: `--dry-run` used to print JSON and now
+prints hex plus base64, so a script parsing that output must pass `--format json`.
+
 Proofs are calldata only: the contract verifies them in memory and stores just the
 chain head and trust configuration. Nothing here records settlements — that belongs
 to the bridge built on top of the light client.
