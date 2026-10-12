@@ -540,6 +540,9 @@ fn check_quorum<C: Crypto>(
 ) -> Result<(StellarValue, u32), Error> {
     let mut counted: Vec<[u8; 32]> = Vec::new();
     let mut value: Option<StellarValue> = None;
+    // Encoded once: every envelope must externalize exactly this, and the
+    // header does not change across the loop.
+    let expected_value_xdr = encode(&header.scp_value)?;
     for (index, raw) in envelopes.iter().enumerate() {
         let envelope: ScpEnvelope = decode(raw).map_err(|_| Error::InvalidEnvelopeXdr { index })?;
         let statement = &envelope.statement;
@@ -550,13 +553,16 @@ fn check_quorum<C: Crypto>(
             continue; // only EXTERNALIZE finalizes a value
         };
 
-        // The externalized value must be exactly the header's SCP value.
-        let externalized: StellarValue = decode(value_bytes(&ext.commit.value))
-            .map_err(|_| Error::InvalidStellarValueXdr { index })?;
-        if externalized != header.scp_value {
+        // The externalized value must be exactly the header's SCP value. Compare
+        // against the header's canonical encoding once, rather than decoding the
+        // embedded `StellarValue` per envelope to compare structurally — this
+        // runs `threshold` times per span and the header does not change.
+        if value_bytes(&ext.commit.value) != expected_value_xdr {
             return Err(Error::ExternalizedValueMismatch { index });
         }
-        value = Some(externalized);
+        if value.is_none() {
+            value = Some(header.scp_value.clone());
+        }
 
         let PublicKey::PublicKeyTypeEd25519(key) = &statement.node_id.0;
         let node_id = key.0;
@@ -567,19 +573,23 @@ fn check_quorum<C: Crypto>(
             continue; // not part of the pinned trust set
         }
 
-        // stellar-core: signature = sign(xdr(networkID, ENVELOPE_TYPE_SCP, statement))
-        // One allocation: the statement is serialised straight into the message
-        // instead of into an intermediate buffer that is then copied across.
-        // This runs once per verified signature — `threshold` times per span.
-        let mut message = Vec::with_capacity(32 + 4 + raw.len());
+        let signature = signature_bytes(&envelope.signature).ok_or(Error::InvalidSignatureLength { index })?;
+        // `ScpEnvelope` is `ScpStatement` followed by `Signature`, and
+        // `Signature` is `opaque<64>` — a 4-byte length plus the 64 bytes
+        // checked just above. So the statement's XDR is already the prefix of
+        // `raw`, and those are precisely the bytes stellar-core signed. Using
+        // them beats re-serialising `statement` per verified signature, and is
+        // stricter: a non-canonical encoding of a statement no longer verifies
+        // against a signature over its canonical form.
+        let statement_len = raw
+            .len()
+            .checked_sub(68)
+            .ok_or(Error::InvalidEnvelopeXdr { index })?;
+        let mut message = Vec::with_capacity(32 + 4 + statement_len);
         message.extend_from_slice(&trust.network_id);
         message.extend_from_slice(&(EnvelopeType::Scp as i32).to_be_bytes());
-        {
-            let mut writer = Limited::new(&mut message, Limits::none());
-            statement.write_xdr(&mut writer).map_err(|_| Error::XdrEncode)?;
-        }
+        message.extend_from_slice(&raw[..statement_len]);
 
-        let signature = signature_bytes(&envelope.signature).ok_or(Error::InvalidSignatureLength { index })?;
         if !crypto.ed25519_verify(&signature, &message, &node_id) {
             return Err(Error::InvalidValidatorSignature { index });
         }
