@@ -1,4 +1,13 @@
 { pkgs, ... }:
+let
+  # One place for the RISC Zero versions this repo is built and measured with.
+  # `enterShell` warns when the running tools differ, and `risc0-setup` installs
+  # exactly these — so changing a number here is the whole upgrade, and the
+  # image-ID / bn254_control_id re-check in the comment below is its checklist.
+  risc0Version = "3.0.6"; # cargo-risczero and r0vm, from nixpkgs (flake.lock)
+  risc0RustToolchain = "1.97.0"; # zkVM rustc, installed by rzup; builds the guest ELF
+  rzupVersion = "0.5.2"; # the rzup that installs it
+in
 {
   # Rust toolchain + the wasm target the NEAR contract is compiled against.
   languages.rust = {
@@ -10,7 +19,12 @@
   packages = with pkgs; [
     # --- RISC Zero zkVM tooling -------------------------------------------
     # Provides `cargo-risczero` and `r0vm` (the zkVM runtime) for building and
-    # proving guests. Verified in-shell at 3.0.6.
+    # proving guests. Not constrained by version here: nixpkgs resolves
+    # whatever `flake.lock` pins, which is currently 3.0.6, and `nix flake
+    # update` would move it silently. `enterShell` warns when the running
+    # version differs from `risc0Version` above, which is what makes a moved
+    # lock visible. (`nix shell nixpkgs#cargo-risczero` is a *different*
+    # nixpkgs — your registry's, 3.0.5 at the time of writing — not this shell.)
     #
     # Version relationship to the pinned verifying key:
     #   tooling       risc0-zkvm 3.0.6        (executor/prover; builds the guest)
@@ -60,22 +74,47 @@
     echo "  tests         : cargo test --workspace"
     echo "  guest toolchain: risc0-setup   (only needed to build/prove a zkVM guest)"
     echo "──────────────────────────────────────────────────────────────"
+
+    # Warn when the running RISC Zero tools differ from the versions this repo is
+    # built and measured with (the `let` block at the top of devenv.nix). A
+    # warning, not an abort: a shell that refuses to open is one you cannot use to
+    # fix it. The nixpkgs pin in flake.lock is what normally keeps these equal.
+    risc0_warn() { printf '  WARNING  %s\n' "$1" >&2; }
+    have_cr="$(cargo risczero --version 2>/dev/null | head -1)"
+    [ "$have_cr" = "cargo-risczero ${risc0Version}" ] || \
+      risc0_warn "cargo-risczero is '$have_cr', expected 'cargo-risczero ${risc0Version}'. A moved flake.lock needs the image ID and bn254_control_id re-checked (see devenv.nix)."
+    have_vm="$(r0vm --version 2>/dev/null | head -1)"
+    [ "$have_vm" = "risc0-r0vm ${risc0Version}" ] || \
+      risc0_warn "r0vm is '$have_vm', expected 'risc0-r0vm ${risc0Version}'."
+    toolchain="$(readlink "$HOME/.rustup/toolchains/risc0" 2>/dev/null || true)"
+    case "$toolchain" in
+      "") ;; # not installed: only needed to build a guest, and risc0-setup installs it
+      *"/v${risc0RustToolchain}-rust-"*) ;;
+      *) risc0_warn "risc0 rust toolchain is $toolchain, expected v${risc0RustToolchain}. Run risc0-setup: a different compiler changes the guest ELF and its image ID." ;;
+    esac
+    unset -f risc0_warn
+    unset have_cr have_vm toolchain
   '';
 
   scripts.risc0-setup.exec = ''
     #!/usr/bin/env bash
-    # Install the zkVM rustc toolchain that `cargo risczero build` needs.
-    # cargo-risczero 3.0.6 no longer installs it directly (its `install`
-    # subcommand just tells you to use rzup), so bootstrap rzup if absent.
+    # Install the zkVM rustc toolchain that `cargo risczero build` needs, at the
+    # version pinned in the `let` block above rather than whatever is latest: the
+    # guest ELF, and therefore its image ID, depends on that compiler.
+    #
+    # Only the `rust` component is installed. cargo-risczero and r0vm come from
+    # nixpkgs (flake.lock); a bare `rzup install` would also download the latest
+    # of both into ~/.risc0, a second set of tools that disagrees with the shell's.
     # Idempotent: safe to run repeatedly. Network-heavy on first run.
     set -euo pipefail
     export PATH="$HOME/.cargo/bin:$PATH"
     if ! command -v rzup >/dev/null 2>&1; then
-      echo "rzup not found — installing it with cargo (first run only)"
-      cargo install rzup --locked
+      echo "rzup not found — installing rzup ${rzupVersion} with cargo (first run only)"
+      cargo install rzup --locked --version ${rzupVersion}
     fi
-    echo "installing the zkVM toolchain via rzup"
-    rzup install
+    echo "installing the zkVM rust toolchain ${risc0RustToolchain} via rzup"
+    rzup install rust ${risc0RustToolchain}
+    rzup use rust ${risc0RustToolchain}
     echo
     echo "done. Build the guest program (receipt proving is a separate step):"
     echo "  cargo risczero build --manifest-path guest/Cargo.toml --features zkvm-entrypoint"

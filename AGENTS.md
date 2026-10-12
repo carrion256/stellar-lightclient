@@ -16,7 +16,14 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
 
 - Rust (stable) with the `wasm32-unknown-unknown` and `wasm32v1-none` targets
   preinstalled (the latter for Soroban contracts).
-- `cargo-risczero` **3.0.6** (with `r0vm`), from nix. The pinned Groth16
+- `cargo-risczero` **3.0.6** (with `r0vm`), from nix. The version comes only from
+  `flake.lock`'s nixpkgs revision (a `nix flake update` can move it), so
+  `devenv.nix` keeps the intended versions in one `let` block and the shell
+  warns on entry if the running `cargo-risczero`/`r0vm`, or the `risc0` rzup rust
+  toolchain (**1.97.0**, which builds the guest ELF), differs. `risc0-setup`
+  installs exactly that toolchain and `rzup` **0.5.2**. Run measurements from
+  this shell: `nix shell nixpkgs#cargo-risczero` is a different nixpkgs and
+  resolves a different version. The pinned Groth16
   verifying key in `groth16-core/src/risc0.rs` and the `ReceiptClaim` digest in
   `groth16-core/src/claim.rs` come from the **3.0.5** verification crates
   (`risc0-groth16`, `risc0-binfmt`, `risc0-zkp`) — those did not move between
@@ -31,8 +38,9 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
   via `get_wrapper`, comparable via `is_wrapper_compatible`), so it has a pinned
   value to check against. The Soroban contract does not — it is a stateless
   verifier and takes both as caller-supplied arguments, so there is nothing to
-  compare against in the deployment and the caller must pin them at integration
-  time.
+  compare against in the deployment and the caller must compare them at
+  integration time. The pair to compare against is `RISC0_CONTROL_ROOT` /
+  `RISC0_BN254_CONTROL_ID` in `groth16_core::risc0`.
 - OpenSSL headers + `pkg-config`, so `openssl-sys` (pulled in by near-workspaces)
   builds against nix's openssl instead of compiling from source.
 - `commit.gpgsign=false` for the session only, via `GIT_CONFIG_*` — this
