@@ -317,9 +317,26 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
 /// one-off input cost at well under 1M cycles, which argues against that — but
 /// it is an inference from two numbers, not a direct measurement.
 ///
-/// Also unmeasured: the precompile win itself. Comparing against a build with
-/// crates.io `sha2`/`ed25519-dalek` is the only way to support or withdraw the
-/// `perf(guest)` claim.
+/// Also measured: whether the precompile swap does anything at all. Same ELF
+/// build procedure, same input, twice — once with RISC Zero's accelerated
+/// `sha2`/`ed25519-dalek` forks, once with the crates.io originals:
+///
+/// ```text
+///                          accelerated    crates.io    ratio
+/// 2 spans, 1 claim          73,097,352   246,278,025   3.37x
+/// 2 spans, no claims        60,730,164   233,851,843   3.85x
+/// parse_tx_set              12,367,188    12,426,182   ~unchanged
+/// ```
+///
+/// `parse_tx_set` is not crypto and must not move between the two builds — its
+/// staying within 0.5% is the control that says the comparison is
+/// apples-to-apples. The 3.4-3.9x on the epoch as a whole is the evidence for
+/// the `perf(guest)` commit.
+///
+/// What that also says: the accelerated build still spends ~30M cycles per span
+/// on work that is not `parse_tx_set`, and only part of it is crypto. Splitting
+/// that remainder is the next question — not whether the precompiles work,
+/// which they do.
 #[test]
 #[ignore]
 fn zkvm_cycle_breakdown() {

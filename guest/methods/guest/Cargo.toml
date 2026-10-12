@@ -34,8 +34,8 @@ risc0-zkvm = { version = "~3.0.5", optional = true }
 [dev-dependencies]
 serde_json = "1"
 base64 = "0.22"
-# For `tests/zkvm_cycles.rs`: execute the built ELF in the zkVM and report the
-# cycle breakdown. Execution only — no proving.
+# For `tests/epoch.rs`'s `zkvm_cycle_breakdown`: execute the built ELF in the
+# zkVM and report the cycle breakdown. Execution only — no proving.
 risc0-zkvm = { version = "~3.0.5", features = ["std"] }
 risc0-binfmt = "~3.0.5"
 # The V1COMPAT kernel the user ELF must be packaged with before execution.
