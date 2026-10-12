@@ -31,9 +31,9 @@
 use std::io::Cursor;
 
 use stellar_xdr::{
-    EnvelopeType, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerUpgrade, Limited, Limits,
-    PublicKey, ReadXdr, ScpEnvelope, ScpStatementPledges, Signature, StellarValue,
-    TransactionEnvelope, TransactionPhase, TransactionSet, TxSetComponent, Value, WriteXdr,
+    EnvelopeType, Hash, LedgerHeader, LedgerUpgrade, Limited, Limits, PublicKey, ReadXdr,
+    ScpEnvelope, ScpStatementPledges, Signature, StellarValue, TransactionEnvelope, TransactionSet,
+    Value, WriteXdr,
 };
 
 mod journal;
@@ -410,7 +410,15 @@ pub fn verify_span<C: Crypto>(
             tx_set_kind_prev(set, pinned_by_set)?
         } else {
             predecessor_version.ok_or(Error::ClaimsRequirePredecessor)?;
-            let (kind, prev, list) = parse_tx_set(set)?;
+            // `txs` is only ever read at the claimed indices, so stop decoding
+            // once the highest one is covered.
+            let cap = proof
+                .claims
+                .iter()
+                .map(|(_, index)| *index as usize + 1)
+                .max()
+                .unwrap_or(1);
+            let (kind, prev, list) = parse_tx_set(set, cap)?;
             if prev.0 != pinned_by_set {
                 return Err(Error::TxSetPreviousLedgerHashMismatch);
             }
@@ -596,10 +604,6 @@ pub(crate) fn decode<T: ReadXdr>(bytes: &[u8]) -> Result<T, stellar_xdr::Error> 
     T::read_xdr_to_end(&mut reader)
 }
 
-fn try_decode<T: ReadXdr>(bytes: &[u8]) -> Option<T> {
-    decode(bytes).ok()
-}
-
 pub(crate) fn encode<T: WriteXdr>(value: &T) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
     let mut writer = Limited::new(&mut buf, Limits::none());
@@ -649,46 +653,101 @@ fn tx_set_kind_prev(bytes: &[u8], expected: [u8; 32]) -> Result<SetKind, Error> 
 /// Whichever encoding re-encodes byte-identically is the one the network
 /// hashed; both encodings start with the previous hash
 /// (`GeneralizedTransactionSet` after the union discriminant).
-fn parse_tx_set(bytes: &[u8]) -> Result<(SetKind, Hash, Vec<TransactionEnvelope>), Error> {
-    if let Some(set) = try_decode::<GeneralizedTransactionSet>(bytes) {
-        // No canonicality re-encode here. The caller hash-checks the raw bytes
-        // against the signed `txSetHash` right after this returns, and
-        // stellar-core computed that hash over the canonical encoding — so a
-        // hash match *is* a proof the bytes are `encode(decode(bytes))`. The
-        // check would otherwise cost a full re-serialisation of every
-        // transaction in the set (hundreds on a real ledger).
-        let GeneralizedTransactionSet::V1(v1) = set;
-        let mut txs = Vec::new();
-        for phase in Vec::from(v1.phases) {
-            match phase {
-                TransactionPhase::V0(components) => {
-                    for component in Vec::from(components) {
-                        let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
-                            component;
-                        txs.extend(Vec::from(component.txs));
-                    }
-                }
-                TransactionPhase::V1(component) => {
-                    // Parallel phase: stages of dependent-tx clusters, flattened in
-                    // serialization order so indices match the set as hashed.
-                    for stage in Vec::from(component.execution_stages) {
-                        for cluster in Vec::from(stage.0) {
-                            txs.extend(Vec::from(cluster.0));
-                        }
-                    }
-                }
-            }
-        }
-        return Ok((SetKind::Generalized, v1.previous_ledger_hash, txs));
+fn parse_tx_set(bytes: &[u8], cap: usize) -> Result<(SetKind, Hash, Vec<TransactionEnvelope>), Error> {
+    // Generalized sets are walked through their framing with `stellar_xdr`'s
+    // own `ReadXdr`, one `TransactionEnvelope` at a time, stopping once `cap`
+    // are in hand. The decoder is the crate's, not ours: canonicality and
+    // error behaviour are what the full parse gave. Only the *count* of
+    // envelopes decoded changes.
+    //
+    // `txs` is consumed solely at the claimed indices (see `verify_span`), and
+    // `verify_outcome_claims` works from raw `envelope_bytes` instead — so
+    // nothing beyond `cap` can be observed. A claims-only span decodes
+    // `max_index + 1` rather than the whole set.
+    if let Some(result) = parse_generalized_capped(bytes, cap)? {
+        return Ok(result);
     }
     // Legacy sets keep the check: their hash is `sha256(prev || envelopes)`
     // rather than a digest of the whole XDR, so it does not subsume
-    // canonicality the way the generalized hash does.
+    // canonicality the way the generalized hash does. That re-encode needs
+    // every envelope, so legacy sets are not capped.
     let set: TransactionSet = decode(bytes).map_err(|_| Error::InvalidTxSetXdr)?;
     if encode(&set)? != bytes {
         return Err(Error::NonCanonicalTxSet);
     }
     Ok((SetKind::Legacy, set.previous_ledger_hash, Vec::from(set.txs)))
+}
+
+/// Incremental generalized-set parse. `Ok(None)` means the framing was not a
+/// generalized set and the caller should try the legacy encoding.
+fn parse_generalized_capped(
+    bytes: &[u8],
+    cap: usize,
+) -> Result<Option<(SetKind, Hash, Vec<TransactionEnvelope>)>, Error> {
+    let mut r = Limited::new(bytes, Limits::none());
+    // `GeneralizedTransactionSet::VARIANTS == [1]`: the union carries its
+    // version in the discriminant, so `V1` is 1, not 0. A legacy
+    // `TransactionSet` opens with its `previous_ledger_hash`, so this is the
+    // same discriminator the previous `try_decode::<GeneralizedTransactionSet>`
+    // used — and, as then, a hash whose first four bytes happen to read as 1
+    // would be misread. Either way the signed `tx_setHash` check below fails
+    // closed on a misclassification.
+    if i32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)? != 1 {
+        return Ok(None);
+    }
+    let previous_ledger_hash = Hash::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+    let phases = u32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+    let mut txs = Vec::new();
+    for _ in 0..phases {
+        let phase = i32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+        match phase {
+            // V0: sequential components, each a fee hint and a flat tx list.
+            0 => {
+                let components = u32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+                for _ in 0..components {
+                    if i32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)? != 0 {
+                        return Ok(None);
+                    }
+                    let _base_fee = Option::<i64>::read_xdr(&mut r)
+                        .map_err(|_| Error::InvalidTxSetXdr)?;
+                    let n = u32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+                    for _ in 0..n {
+                        if txs.len() >= cap {
+                            return Ok(Some((SetKind::Generalized, previous_ledger_hash, txs)));
+                        }
+                        txs.push(
+                            TransactionEnvelope::read_xdr(&mut r)
+                                .map_err(|_| Error::InvalidTxSetXdr)?,
+                        );
+                    }
+                }
+            }
+            // V1: parallel phase — stages of dependent-tx clusters, flattened
+            // in serialization order so indices match the set as hashed.
+            1 => {
+                let _base_fee = Option::<i64>::read_xdr(&mut r)
+                    .map_err(|_| Error::InvalidTxSetXdr)?;
+                let stages = u32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+                for _ in 0..stages {
+                    let clusters = u32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+                    for _ in 0..clusters {
+                        let n = u32::read_xdr(&mut r).map_err(|_| Error::InvalidTxSetXdr)?;
+                        for _ in 0..n {
+                            if txs.len() >= cap {
+                                return Ok(Some((SetKind::Generalized, previous_ledger_hash, txs)));
+                            }
+                            txs.push(
+                                TransactionEnvelope::read_xdr(&mut r)
+                                    .map_err(|_| Error::InvalidTxSetXdr)?,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some((SetKind::Generalized, previous_ledger_hash, txs)))
 }
 
 fn value_bytes(value: &Value) -> &[u8] {
