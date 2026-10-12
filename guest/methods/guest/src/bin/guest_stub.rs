@@ -15,7 +15,16 @@
 //! identical to the real guest's — it is the cycle count that differs.
 //!
 //! `required-features` in Cargo.toml keeps this target out of builds without
-//! `--features zkvm-entrypoint`, so no `compile_error!` guard is needed here.
+//! `--features zkvm-entrypoint`; the `compile_error` below is the same guard
+//! `guest.rs` carries, so a stray `cargo build --bin guest-stub` cannot silently
+//! produce a stubbed guest. Note the meta-item form — `compile_error("…")`,
+//! no `!`. Inside `cfg_attr` the attribute is passed through as an AST node
+//! rather than invoked, and the bang makes rustc reject it at parse time
+//! regardless of the predicate.
+#![cfg_attr(
+    not(feature = "zkvm-entrypoint"),
+    compile_error("guest-stub bin requires --features zkvm-entrypoint")
+)]
 struct StubCrypto;
 
 impl verify_core::Crypto for StubCrypto {
