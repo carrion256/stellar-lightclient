@@ -302,7 +302,7 @@ class FileArgsLifecycleTests(unittest.TestCase):
             f.write_text(json.dumps(proof(tx_set_b64=self.BIG)))
             proc = subprocess.run(
                 [sys.executable, str(HERE / "relay.py"),
-                 "--proof", str(f), "--contract", "lc.testnet",
+                 "--proof", str(f), "--contract", "lc.testnet", "--format", "json",
                  "--signer", "relayer.testnet", "--send"],
                 capture_output=True, text=True, env=env,
             )
@@ -324,7 +324,7 @@ class FileArgsLifecycleTests(unittest.TestCase):
             f.write_text(json.dumps(proof(tx_set_b64=self.BIG)))
             proc = subprocess.run(
                 [sys.executable, str(HERE / "relay.py"),
-                 "--proof", str(f), "--contract", "lc.testnet",
+                 "--proof", str(f), "--contract", "lc.testnet", "--format", "json",
                  "--signer", "relayer.testnet"],
                 capture_output=True, text=True,
             )
@@ -332,6 +332,31 @@ class FileArgsLifecycleTests(unittest.TestCase):
             expected_span = relay.build_span(proof(tx_set_b64=self.BIG), -1, True)
             expected_size = len(json.dumps({"span": expected_span}, separators=(",", ":")).encode())
             self.assertEqual(self.run_replay(proc.stdout, env), str(expected_size))
+
+    def test_default_encoding_is_borsh(self):
+        """`--format` is absent here: the default must be the cheaper encoding.
+
+        The size must match `encode_borsh` exactly, and must NOT match the JSON
+        encoding — otherwise a silent flip back to the 27%-larger JSON payload
+        would still pass.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _ = self.fake_env(d)
+            f = Path(d) / "proof.json"
+            out = Path(d) / "span.args"
+            f.write_text(json.dumps(proof()))
+            proc = subprocess.run(
+                [sys.executable, str(HERE / "relay.py"),
+                 "--proof", str(f), "--contract", "lc.testnet",
+                 "--signer", "relayer.testnet", "--output", str(out)],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            span = relay.build_span(proof(), -1, True)
+            expected_borsh = len(relay.encode_borsh(span))
+            expected_json = len(json.dumps({"span": span}, separators=(",", ":")).encode())
+            self.assertNotEqual(expected_borsh, expected_json, "fixture is too small to discriminate")
+            self.assertEqual(out.stat().st_size, expected_borsh)
 
     def test_output_path_used_by_printed_command(self):
         with tempfile.TemporaryDirectory() as d:
@@ -341,7 +366,7 @@ class FileArgsLifecycleTests(unittest.TestCase):
             f.write_text(json.dumps(proof()))
             proc = subprocess.run(
                 [sys.executable, str(HERE / "relay.py"),
-                 "--proof", str(f), "--contract", "lc.testnet",
+                 "--proof", str(f), "--contract", "lc.testnet", "--format", "json",
                  "--signer", "relayer.testnet", "--output", str(out)],
                 capture_output=True, text=True,
             )

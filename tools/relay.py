@@ -18,7 +18,7 @@ to the bridge built on top of the light client.
 
 Usage:
     tools/relay.py --proof testdata/fixture.json --contract lc.testnet --dry-run
-    tools/relay.py --proof testdata/fixture.json --contract lc.testnet --format borsh --dry-run
+    tools/relay.py --proof testdata/fixture.json --contract lc.testnet --format json --dry-run
     tools/relay.py --proof testdata/fixture.json --contract lc.testnet --signer relayer.testnet --send
 
 `--send` invokes `near-cli-rs` using a temporary file for either encoding.
@@ -180,9 +180,11 @@ def main() -> int:
     )
     ap.add_argument(
         "--format",
-        default="json",
+        default="borsh",
         choices=("json", "borsh"),
-        help="call encoding: json for submit_span, borsh for submit_span_raw",
+        help="call encoding: borsh (default) for submit_span_raw — ~27% smaller "
+        "calldata and no JSON parsing on-chain; json for submit_span, useful when "
+        "an explorer or wallet needs to read the payload",
     )
     ap.add_argument("--no-claims", action="store_true", help="omit the tail's tx claim")
     ap.add_argument("--gas", default="300.0 Tgas", help="prepaid gas (default: 300.0 Tgas)")
