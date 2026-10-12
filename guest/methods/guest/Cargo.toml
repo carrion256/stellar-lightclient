@@ -50,6 +50,13 @@ default = []
 zkvm-entrypoint = ["dep:risc0-zkvm"]
 
 [[bin]]
+name = "guest-stub"
+path = "src/bin/guest_stub.rs"
+# Measurement-only: same as `guest` but with ed25519 verification stubbed out,
+# used to split the cycle count. Not the production guest.
+required-features = ["zkvm-entrypoint"]
+
+[[bin]]
 name = "guest"
 path = "src/bin/guest.rs"
 # Cargo skips this target entirely unless the feature is on, so native

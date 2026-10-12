@@ -347,16 +347,33 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
 /// `ed25519-dalek`'s verify path has stopped routing through the accelerated
 /// ops. Check the call site, not the manifest.
 ///
-/// What that leaves open: the split of the 60.7M on the accelerated build. The
-/// A/B bounds the *saving* — crypto acceleration removed 173M of the 233.9M
-/// unaccelerated cost — but it does not split what remains, which is
-/// `non-crypto + accelerated-crypto` and only `parse_tx_set` is individually
-/// attributed. Non-crypto work is present and identical across both builds
-/// (XDR decode of 30 envelopes and 2 headers per span, bincode input decode),
-/// which is precisely why `parse_tx_set` did not move; but whether the 60.7M is
-/// mostly the remaining accelerated crypto or mostly that generic work is not
-/// something these numbers answer. Do not read the 3.4x as "crypto is now
-/// cheap" — read it as "the saving is 173M cycles".
+/// What that leaves open no longer is. Running the same input through
+/// `guest-stub` — identical except `ed25519_verify` returns `true` — splits the
+/// cost exactly:
+///
+/// ```text
+/// 2 spans, 1 claim        real 73,097,352    stub 24,349,893
+/// 2 spans, no claims      real 60,730,164    stub 11,976,932
+///
+/// ed25519 (60 verifies)   48,747,459   66.7%
+/// parse_tx_set            12,367,188   16.9%
+/// all other generic work  11,976,932   16.4%   (XDR decode of 60 envelopes and
+///                                              4 headers, bincode input,
+///                                              journal encode, sha256)
+/// ```
+///
+/// The components sum exactly to the total, and `stub(2 spans, 1 claim) -
+/// stub(2 spans, no claims) = 12,372,961` matches `parse_tx_set` independently —
+/// so the split is measured, not inferred. Note the ed25519 figure is *with*
+/// the precompiles; at ~812k cycles per verify it is still two thirds of the
+/// epoch.
+///
+/// That changes the optimisation order. The byte-span walk's ceiling is
+/// `parse_tx_set` plus some of the 12M generic remainder — call it 30% at the
+/// very outside, and less once a walk to the claimed envelope is priced in.
+/// Meanwhile 66.7% is `threshold` ed25519 verifications, which is a trust-set
+/// parameter, not a code one. Further code optimisation on this path is
+/// bounded well below the thing that dominates it.
 #[test]
 #[ignore]
 fn zkvm_cycle_breakdown() {
@@ -365,7 +382,11 @@ fn zkvm_cycle_breakdown() {
     use risc0_zkvm::{default_executor, ExecutorEnv};
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let elf_path = root.join("target/riscv32im-risc0-zkvm-elf/release/guest");
+    // Override with `GUEST_ELF` to measure a different build — the
+    // `guest-stub` binary exists to split the cycle count.
+    let elf_path = std::env::var_os("GUEST_ELF")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join("target/riscv32im-risc0-zkvm-elf/release/guest"));
     let user_elf = std::fs::read(&elf_path)
         .unwrap_or_else(|e| panic!("build the guest ELF first ({elf_path:?}): {e}"));
 
