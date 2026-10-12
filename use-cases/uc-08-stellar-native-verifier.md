@@ -1,7 +1,22 @@
 # 08 - Groth16 verifier on Stellar
 
-**Status: new verifier port.** The verifier exists in this repository
-(`verifier/`); it is written against NEAR host functions and must be ported.
+**Status: shipped.** `stellar-verifier/` is a Soroban contract sharing
+`groth16-core` with the NEAR verifier, with 22 tests covering the real RISC
+Zero 3.0 receipt and the negative cases. Measured cost, per verification of the
+real fixture: **26,280,240 CPU instructions, 281,607 memory bytes**.
+
+Its trust model differs from the NEAR contract's and that is deliberate:
+`control_root` and `bn254_control_id` are **caller arguments, not stored pins**,
+because both feed the Groth16 public inputs — they are part of the statement
+being proven, so a wrong value fails to verify rather than widening what is
+accepted. The consequence is that the contract supplies **no reference values**:
+a consumer wanting "this receipt came from RISC Zero release X" must pin both
+against X at integration time. There is therefore no stored wrapper identity to
+rotate and no stranding risk; the NEAR deployment keeps `get_wrapper` /
+`is_wrapper_compatible` because it *does* store one.
+
+One acceptance criterion below remains open: the seal-build check confirming a
+freshly built seal's `bn254_control_id` matches the pinned value.
 
 ## Problem
 

@@ -70,7 +70,7 @@ proofs must derive them by replaying state; each document says so.
 | [05](uc-05-bridge-of-trust.md) | Configurable third-party bridge of trust | Stellar events to a threshold signer set | **Composes** | operator-deployable config; deliberately not operated by us |
 | [06](uc-06-hedge-coverage-attestation.md) | Hedge / option coverage attestation | a covering option or policy exists | **New proving work** | attestation of the venue position (shares #04's witness leg) |
 | [07](uc-07-verifiable-state-reads.md) | Verifiable state reads and off-chain attestation | an arbitrary Rust program ran and committed a journal | **Composes** | the specific guest program per assertion |
-| [08](uc-08-stellar-native-verifier.md) | Groth16 verifier on Stellar | a RISC Zero receipt, verified on Stellar | **In progress** | CAP-0074 supplies the BN254 ops; the work is the wire-encoding provider and measurement |
+| [08](uc-08-stellar-native-verifier.md) | Groth16 verifier on Stellar | a RISC Zero receipt, verified on Stellar | **Shipped** | seal-build check of `bn254_control_id` |
 
 Status vocabulary:
 

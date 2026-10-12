@@ -127,9 +127,10 @@ calldata-json contract='lc.testnet':
 # ── maintenance ──────────────────────────────────────────────────────────────
 
 # Remove build output and generated calldata (keeps testdata fixtures).
-# `stellar-verifier/target` is its own workspace's cache and is easy to miss.
+# The nested workspace caches are easy to miss: `guest/methods/guest/target`
+# holds the zkVM ELF, and `stellar-verifier/target` is its own root.
 clean:
-    rm -rf target target-* guest/target stellar-verifier/target
+    rm -rf target target-* guest/target guest/methods/guest/target stellar-verifier/target
     rm -f /tmp/span.borsh /tmp/stellar-fixture.json
 
 # Show uncommitted work before handing the tree to someone else.
