@@ -11,7 +11,10 @@ use crate::ops::NearOps;
 use groth16_core::bn254::Fr;
 use groth16_core::groth16::Proof;
 
-pub use groth16_core::risc0::{pinned_vk_unchecked, public_inputs, seal_to_proof, verifying_key};
+pub use groth16_core::risc0::{
+    pinned_vk_unchecked, public_inputs, seal_to_proof, verifying_key, RISC0_BN254_CONTROL_ID,
+    RISC0_CONTROL_ROOT,
+};
 
 /// [`groth16_core::risc0::verify`] with the NEAR provider: Groth16-verify a
 /// decoded proof against the pinned RISC Zero verifying key, skipping the

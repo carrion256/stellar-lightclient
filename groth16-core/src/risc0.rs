@@ -134,6 +134,33 @@ pub fn seal_to_proof(seal: &[u8]) -> Result<Proof, String> {
     })
 }
 
+/// The `control_root` of the RISC Zero release this crate's pinned verifying key
+/// belongs to — `ALLOWED_CONTROL_ROOT` in `risc0-circuit-recursion`
+/// (`src/control_id.rs`), digest
+/// `a54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56`.
+///
+/// A verifier built on [`public_inputs`] does not store a wrapper identity: the
+/// caller supplies `control_root` and `bn254_control_id` per receipt, and a wrong
+/// value merely fails to verify. Nothing therefore stops a *different* RISC Zero
+/// release that shares this Groth16 key from producing a receipt that verifies
+/// under its own pair. A consumer that wants "this receipt came from the release
+/// we audited" must compare against these constants itself.
+pub const RISC0_CONTROL_ROOT: [u8; 32] = [
+    0xa5, 0x4d, 0xc8, 0x5a, 0xc9, 0x9f, 0x85, 0x1c, 0x92, 0xd7, 0xc9, 0x6d, 0x73, 0x18, 0xaf, 0x41,
+    0xdb, 0xe7, 0xc0, 0x19, 0x4e, 0xdf, 0xcc, 0x37, 0xeb, 0x4d, 0x42, 0x2a, 0x99, 0x8c, 0x1f, 0x56,
+];
+
+/// The `bn254_control_id` paired with [`RISC0_CONTROL_ROOT`] —
+/// `BN254_IDENTITY_CONTROL_ID` in `risc0-circuit-recursion`
+/// (`src/control_id.rs`), digest
+/// `c07a65145c3cb48b6101962ea607a4dd93c753bb26975cb47feb00d3666e4404`, in the
+/// byte order the digest is printed and the fixture records it (the
+/// risc0-groth16 byte reversal happens inside [`public_inputs`]).
+pub const RISC0_BN254_CONTROL_ID: [u8; 32] = [
+    0xc0, 0x7a, 0x65, 0x14, 0x5c, 0x3c, 0xb4, 0x8b, 0x61, 0x01, 0x96, 0x2e, 0xa6, 0x07, 0xa4, 0xdd,
+    0x93, 0xc7, 0x53, 0xbb, 0x26, 0x97, 0x5c, 0xb4, 0x7f, 0xeb, 0x00, 0xd3, 0x66, 0x6e, 0x44, 0x04,
+];
+
 /// Claim public inputs: `[ctrl_hi, ctrl_lo, claim_hi, claim_lo,
 /// bn254_control_id_rev]`, each an [`Fr`].
 ///

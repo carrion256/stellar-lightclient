@@ -204,18 +204,26 @@ there become real:
       tests, ported, not just the positive one.
 - [x] The claim digest is derived by the contract, not accepted from the caller.
 - [ ] The pinned VK and `ReceiptClaim` digest match a freshly built seal's
-      `bn254_control_id`.
-- [ ] **Partial:** measured cost per verification is published — **27,677,866 cpu insns /
+      `bn254_control_id`. **Partly evidenced, not closed:** the pair is now named
+      in `groth16_core::risc0` (`RISC0_CONTROL_ROOT`, `RISC0_BN254_CONTROL_ID`),
+      equals upstream's `ALLOWED_CONTROL_ROOT` / `BN254_IDENTITY_CONTROL_ID`
+      in `risc0-circuit-recursion`, and is the pair the genuine receipt verifies
+      under (`reference_constants_are_the_genuine_receipts_control_pair`, which
+      also shows a one-bit change fails). A seal built from scratch is still the
+      definitive check and has not been run.
+- [x] Measured cost per verification is published: **27,677,866 cpu insns /
       292,462 mem bytes** for the real receipt (26,280,240 / 281,607 for the
-      toy circuit). The comparison to the NEAR baseline
-      (`verifier/tests/risc0_verify.rs:116-120`) is still outstanding, and the
-      two are not directly comparable: Soroban meters cpu insns and memory,
-      NEAR meters gas. A conversion needs a stated basis, not a side-by-side
-      number.
+      toy circuit).
+- [ ] The cost is compared to the NEAR baseline
+      (`verifier/tests/risc0_verify.rs:116-120`). The two are not directly
+      comparable — Soroban meters cpu insns and memory, NEAR meters gas — so a
+      conversion needs a stated basis, not a side-by-side number.
 - [x] Wrapper identity is rotatable, with the stranding risk documented —
       **not applicable here, by design.** There is no stored wrapper identity:
       `control_root`/`bn254_control_id` are caller arguments folded into the
       Groth16 public inputs, so a wrong value fails rather than widens. Nothing
       to rotate, nothing to strand. The consequence is the inverse — the
-      contract supplies no reference values, so the consumer must pin against a
-      named RISC Zero release at integration time.
+      contract supplies no reference values, so the consumer must compare the
+      pair against a named RISC Zero release at integration time. The reference
+      pair to compare against is `RISC0_CONTROL_ROOT` / `RISC0_BN254_CONTROL_ID`
+      in `groth16_core::risc0`.

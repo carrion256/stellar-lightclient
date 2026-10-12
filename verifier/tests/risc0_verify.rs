@@ -615,6 +615,47 @@ fn ok_claim_digest_matches_risc0_reference() {
     assert_ne!(ours, other);
 }
 
+/// The named reference constants must be the values the genuine upstream receipt
+/// was proven against, and they must actually be load-bearing: the receipt
+/// verifies when built from the constants alone, and stops verifying when the
+/// control root differs by a single bit.
+///
+/// The discriminating half matters. A constant that merely equalled the fixture's
+/// JSON would pass the first assertion even if nothing consumed it; flipping a bit
+/// and watching verification fail is what shows the pair is bound into the
+/// statement rather than decorative.
+#[test]
+fn reference_constants_are_the_genuine_receipts_control_pair() {
+    testing_env!(VMContextBuilder::new().build());
+    let f: Value = serde_json::from_str(include_str!(
+        "../../testdata/risc0_receipt_fixture.json"
+    )).unwrap();
+    let word = |key: &str| -> [u8; 32] { hex_bytes(&f[key]).try_into().unwrap() };
+
+    assert_eq!(risc0::RISC0_CONTROL_ROOT, word("control_root"));
+    assert_eq!(risc0::RISC0_BN254_CONTROL_ID, word("bn254_control_id"));
+
+    let claim = verifier::claim::claim_digest(&verifier::claim::ok_claim(
+        word("image_id"), &hex_bytes(&f["journal"]),
+    ));
+    let proof = risc0::seal_to_proof(&hex_bytes(&f["seal"])).unwrap();
+
+    let inputs = risc0::public_inputs(
+        risc0::RISC0_CONTROL_ROOT, claim, risc0::RISC0_BN254_CONTROL_ID,
+    ).unwrap();
+    assert!(risc0::verify(&proof, &inputs), "receipt verifies from the constants alone");
+
+    let mut wrong_root = risc0::RISC0_CONTROL_ROOT;
+    wrong_root[0] ^= 1;
+    let inputs = risc0::public_inputs(wrong_root, claim, risc0::RISC0_BN254_CONTROL_ID).unwrap();
+    assert!(!risc0::verify(&proof, &inputs), "a one-bit-different control root must not verify");
+
+    let mut wrong_id = risc0::RISC0_BN254_CONTROL_ID;
+    wrong_id[31] ^= 1;
+    let inputs = risc0::public_inputs(risc0::RISC0_CONTROL_ROOT, claim, wrong_id).unwrap();
+    assert!(!risc0::verify(&proof, &inputs), "a one-bit-different bn254 control id must not verify");
+}
+
 #[test]
 fn genuine_risc0_receipt_verifies_and_binds_public_inputs() {
     testing_env!(VMContextBuilder::new().build());
