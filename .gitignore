@@ -2,6 +2,7 @@
 /target*/
 /guest/target*/
 /guest/methods/guest/target/
+/stellar-verifier/target/
 
 # devenv / direnv
 .devenv/

@@ -35,3 +35,18 @@ serde_json = "1"
 # the BN254 host functions for real (soroban-env-host 28 depends on
 # ark-bn254/ark-ec), so tests exercise the actual host path.
 soroban-sdk = { version = "28", features = ["testutils"] }
+
+[workspace]
+
+# Own workspace root so the repository's `[profile.release]` does not reach it.
+# Soroban caps the uploaded wasm and rejects anything over it, so this contract
+# builds for *size* while the NEAR contract builds for *gas* (NEAR meters
+# instruction count). Measured on the same source: 124,463 B at `opt-level = 3`
+# versus 54,523 B at `"z"`.
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+strip = true
+# Required by `stellar contract build`: contracts must not silently wrap.
+overflow-checks = true

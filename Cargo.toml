@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["contract", "tools/xtask", "tools/groth16-fixture", "verifier", "verify-core", "groth16-core", "stellar-verifier"]
-# `guest/` is its own workspace (see guest/Cargo.toml): cargo risczero builds it
-# standalone with --manifest-path, and a nested root must be excluded here.
-exclude = ["guest"]
+members = ["contract", "tools/xtask", "tools/groth16-fixture", "verifier", "verify-core", "groth16-core"]
+# `guest/` and `stellar-verifier/` are their own workspaces. cargo risczero
+# builds the guest standalone with --manifest-path; Soroban caps the uploaded
+# wasm, so `stellar-verifier` must build for size while the NEAR contract builds
+# for gas. A nested root must be excluded here.
+exclude = ["guest", "stellar-verifier"]
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"

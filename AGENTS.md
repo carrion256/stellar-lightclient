@@ -45,6 +45,7 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
 |---|---|
 | contract wasm | `cargo build -p stellar-light-client --release --target wasm32-unknown-unknown` |
 | workspace tests, including NEAR sandbox | `cargo test --workspace` |
+| Soroban verifier tests (own workspace) | `cargo test --manifest-path stellar-verifier/Cargo.toml` |
 | standalone guest tests | `cargo test --manifest-path guest/methods/guest/Cargo.toml` |
 | relayer tests | `python3 -m unittest discover -s tools -p test_relay.py` |
 | NEAR contract wasm | `cargo build -p stellar-light-client --release --target wasm32-unknown-unknown` |
