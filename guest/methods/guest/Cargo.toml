@@ -34,6 +34,13 @@ risc0-zkvm = { version = "3.0.5", optional = true }
 [dev-dependencies]
 serde_json = "1"
 base64 = "0.22"
+# For `tests/zkvm_cycles.rs`: execute the built ELF in the zkVM and report the
+# cycle breakdown. Execution only — no proving.
+risc0-zkvm = { version = "3.0.5", features = ["std"] }
+risc0-binfmt = "3.0.5"
+# The V1COMPAT kernel the user ELF must be packaged with before execution.
+# Versioned independently of `risc0-zkvm`; 2.2.3 is what the zkvm 3.x line pulls.
+risc0-zkos-v1compat = "2.2.3"
 # Threshold computation in tests decodes real SCP envelopes, exactly like
 # `contract/src/tests.rs::trust_set_and_externalizers` does.
 stellar-xdr = "28"
@@ -54,3 +61,11 @@ required-features = ["zkvm-entrypoint"]
 # Without it the docker build resolves dependencies freely (it picked bincode 2
 # against bincode-1 API code) and is not reproducible.
 [workspace]
+
+# `ed25519-dalek`'s `curve25519-dalek` uses `crypto-bigint`'s `risc0` backend
+# when built for the zkVM, which the crates.io `crypto-bigint` does not provide.
+# RISC Zero's fork of `curve25519-dalek` expects this override — its own
+# workspace root carries the same entry — so without it the guest compiles
+# natively (the risc0 backend is cfg'd out) and only fails for the zkVM target.
+[patch.crates-io]
+crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint", tag = "v0.5.5-risczero.0" }

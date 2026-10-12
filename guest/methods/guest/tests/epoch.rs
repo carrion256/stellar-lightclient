@@ -283,6 +283,66 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
     assert!(guest::run_epoch_bytes(&oversized).is_err());
 }
 
+/// Execute the built guest ELF in the zkVM and report the cycle breakdown.
+/// Execution only — no proving.
+///
+/// Requires the ELF at `target/riscv32im-risc0-zkvm-elf/release/guest`; build it
+/// first with the rustup/risc0 toolchain command in AGENTS.md. `#[ignore]`d so
+/// the default suite does not depend on that artifact.
+///
+/// Run with `RISC0_INFO=1` for the precompile-usage breakdown — that is the
+/// number that says whether `ed25519`/`sha256` are reaching the accelerated
+/// circuits and where the remaining cycles go.
+#[test]
+#[ignore]
+fn zkvm_cycle_breakdown() {
+    use risc0_binfmt::ProgramBinary;
+    use risc0_zkos_v1compat::V1COMPAT_ELF;
+    use risc0_zkvm::{default_executor, ExecutorEnv};
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf_path = root.join("target/riscv32im-risc0-zkvm-elf/release/guest");
+    let user_elf = std::fs::read(&elf_path)
+        .unwrap_or_else(|e| panic!("build the guest ELF first ({elf_path:?}): {e}"));
+
+    // RISC Zero 3 requires the user ELF to be packaged with the V1COMPAT
+    // kernel before execution — `execute` takes the encoded `ProgramBinary`,
+    // not the bare ELF.
+    let encoded = ProgramBinary::new(&user_elf, V1COMPAT_ELF).encode();
+
+    // Two runs of the identical program: the full epoch, and the same epoch with
+    // every inclusion claim removed. Claims are what force `parse_tx_set` —
+    // without them `verify_span` only peeks at the set header — so the delta is
+    // that parse's cycle cost. In the guest there is no precompile for XDR, so
+    // this is the unaccelerated term that the ed25519/sha256 swaps leave behind.
+    let run = |input: &guest::EpochInput| -> u64 {
+        let payload = bincode::serialize(input).unwrap();
+        let env = ExecutorEnv::builder()
+            .write(&payload.len())
+            .unwrap()
+            .write_slice(&payload)
+            .build()
+            .unwrap();
+        let session = default_executor().execute(env, &encoded).unwrap();
+        decode_journal(&session.journal.bytes).expect("guest journal must decode");
+        session.segments.iter().map(|s| s.cycles as u64).sum()
+    };
+
+    let full = epoch_input(&fixture());
+    let mut no_claims = epoch_input(&fixture());
+    for span in &mut no_claims.spans {
+        span.claims.clear();
+    }
+
+    let with_claims = run(&full);
+    let without = run(&no_claims);
+    eprintln!(
+        "zkvm cycles: full epoch {with_claims} across 80 segments\n  without claims: {without}\n  -> parse_tx_set: {} ({:.1}% of total)",
+        with_claims.saturating_sub(without),
+        100.0 * (with_claims.saturating_sub(without)) as f64 / with_claims as f64
+    );
+}
+
 #[test]
 fn outcome_claims_land_in_the_journal() {
     let fixture = fixture();
