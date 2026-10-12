@@ -544,11 +544,16 @@ fn check_quorum<C: Crypto>(
         }
 
         // stellar-core: signature = sign(xdr(networkID, ENVELOPE_TYPE_SCP, statement))
-        let statement_xdr = encode(statement)?;
-        let mut message = Vec::with_capacity(32 + 4 + statement_xdr.len());
+        // One allocation: the statement is serialised straight into the message
+        // instead of into an intermediate buffer that is then copied across.
+        // This runs once per verified signature — `threshold` times per span.
+        let mut message = Vec::with_capacity(32 + 4 + raw.len());
         message.extend_from_slice(&trust.network_id);
         message.extend_from_slice(&(EnvelopeType::Scp as i32).to_be_bytes());
-        message.extend_from_slice(&statement_xdr);
+        {
+            let mut writer = Limited::new(&mut message, Limits::none());
+            statement.write_xdr(&mut writer).map_err(|_| Error::XdrEncode)?;
+        }
 
         let signature = signature_bytes(&envelope.signature).ok_or(Error::InvalidSignatureLength { index })?;
         if !crypto.ed25519_verify(&signature, &message, &node_id) {
