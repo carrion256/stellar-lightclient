@@ -9,7 +9,7 @@
 //! verification path.
 
 use bincode::Options;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey, verify_batch};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -46,6 +46,32 @@ impl Crypto for Sha256Dalek {
         // two rules actually part; building a signature valid under a weak key
         // needs a degenerate nonce.
         key.verify(message, &sig).is_ok()
+    }
+
+    /// One multi-scalar multiplication for the whole quorum instead of
+    /// `2 * n` double-base muls. `verify_batch` derives its per-signature
+    /// weights from a Merlin transcript (`ZeroRng`), so it is deterministic and
+    /// safe to run inside the zkVM — no OS entropy anywhere in the path.
+    ///
+    /// The verifier semantics are unchanged: the caller falls back to
+    /// per-signature checks whenever this returns `false`, so a bad batch
+    /// still names the offending index.
+    fn ed25519_verify_batch(
+        &self,
+        signatures: &[[u8; 64]],
+        messages: &[&[u8]],
+        public_keys: &[[u8; 32]],
+    ) -> bool {
+        if signatures.len() != messages.len() || signatures.len() != public_keys.len() {
+            return false;
+        }
+        let sigs: Vec<Signature> = signatures.iter().map(Signature::from_bytes).collect();
+        let keys: Result<Vec<VerifyingKey>, _> =
+            public_keys.iter().map(|k| VerifyingKey::from_bytes(k)).collect();
+        match keys {
+            Ok(keys) => verify_batch(messages, &sigs, &keys).is_ok(),
+            Err(_) => false,
+        }
     }
 }
 

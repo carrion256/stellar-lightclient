@@ -51,6 +51,28 @@ pub use outcomes::{
 pub trait Crypto {
     fn sha256(&self, bytes: &[u8]) -> [u8; 32];
     fn ed25519_verify(&self, signature: &[u8; 64], message: &[u8], public_key: &[u8; 32]) -> bool;
+
+    /// Verify `threshold` signatures as one batch. The default falls back to
+    /// individual verification, which is all a provider whose host exposes no
+    /// batch primitive (NEAR's `ed25519_verify` is one signature per call) can
+    /// do. A provider that *can* batch — the zkVM guest, where one
+    /// multi-scalar multiplication replaces `2n` double-base muls — overrides
+    /// this and gets the whole quorum check for roughly the cost of a handful
+    /// of individual verifies.
+    ///
+    /// Batch verification is all-or-nothing: `false` means at least one item is
+    /// bad, not which. Callers that need to name a failing index fall back to
+    /// [`Crypto::ed25519_verify`] per item.
+    fn ed25519_verify_batch(
+        &self,
+        signatures: &[[u8; 64]],
+        messages: &[&[u8]],
+        public_keys: &[[u8; 32]],
+    ) -> bool {
+        signatures.iter().zip(messages.iter()).zip(public_keys.iter()).all(
+            |((signature, message), public_key)| self.ed25519_verify(signature, message, public_key),
+        )
+    }
 }
 
 /// Trust configuration — deliberately configuration, not consensus: Stellar
@@ -543,6 +565,11 @@ fn check_quorum<C: Crypto>(
     // Encoded once: every envelope must externalize exactly this, and the
     // header does not change across the loop.
     let expected_value_xdr = encode(&header.scp_value)?;
+    // Collected for one batch check once `threshold` candidates are in hand.
+    let mut batch_sigs: Vec<[u8; 64]> = Vec::with_capacity(trust.threshold as usize);
+    let mut batch_keys: Vec<[u8; 32]> = Vec::with_capacity(trust.threshold as usize);
+    let mut batch_msgs: Vec<Vec<u8>> = Vec::with_capacity(trust.threshold as usize);
+    let mut batch_idx: Vec<usize> = Vec::with_capacity(trust.threshold as usize);
     for (index, raw) in envelopes.iter().enumerate() {
         let envelope: ScpEnvelope = decode(raw).map_err(|_| Error::InvalidEnvelopeXdr { index })?;
         let statement = &envelope.statement;
@@ -589,13 +616,38 @@ fn check_quorum<C: Crypto>(
         message.extend_from_slice(&(EnvelopeType::Scp as i32).to_be_bytes());
         message.extend_from_slice(&raw[..statement_len]);
 
-        if !crypto.ed25519_verify(&signature, &message, &node_id) {
-            return Err(Error::InvalidValidatorSignature { index });
-        }
+        batch_sigs.push(signature);
+        batch_keys.push(node_id);
+        batch_msgs.push(message);
+        batch_idx.push(index);
         counted.push(node_id);
         if counted.len() as u32 >= trust.threshold {
             break;
         }
+    }
+    // One batch check for the whole quorum. A provider that cannot batch gets
+    // the default `ed25519_verify` loop and is unchanged.
+    //
+    // Checked before the quorum count: the per-signature path failed on a bad
+    // signature as it met one, even when quorum would not have been reached
+    // anyway. Keeping that ordering preserves "a tampered signature is named"
+    // over "quorum fell short".
+    let msg_refs: Vec<&[u8]> = batch_msgs.iter().map(Vec::as_slice).collect();
+    if !crypto.ed25519_verify_batch(&batch_sigs, &msg_refs, &batch_keys) {
+        // Batch verification is all-or-nothing: `false` says one of them is bad
+        // but not which. Re-check individually to name it, so the error stays
+        // `InvalidValidatorSignature { index }` exactly as before.
+        for (((signature, message), key), index) in batch_sigs
+            .iter()
+            .zip(batch_msgs.iter())
+            .zip(batch_keys.iter())
+            .zip(batch_idx.iter())
+        {
+            if !crypto.ed25519_verify(signature, message, key) {
+                return Err(Error::InvalidValidatorSignature { index: *index });
+            }
+        }
+        return Err(Error::InvalidValidatorSignature { index: batch_idx[0] });
     }
     let signers = counted.len() as u32;
     if signers < trust.threshold {
