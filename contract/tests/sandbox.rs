@@ -920,6 +920,13 @@ async fn e2e_borsh_raw_span_submission_advances_the_head() -> anyhow::Result<()>
         .transact()
         .await?;
     assert!(outcome.is_success(), "raw submit_span failed: {:?}", outcome.logs());
+    // The production path the relayer uses. Printed so its cost is recorded
+    // alongside the JSON path's rather than inferred from calldata size.
+    println!(
+        "submit_span_raw ({} txs in set): {} Tgas burnt on-chain",
+        tail["tx_count"],
+        outcome.total_gas_burnt.as_gas() / 1_000_000_000_000,
+    );
     assert_eq!(
         storage_before,
         contract.view_account().await?.storage_usage,
