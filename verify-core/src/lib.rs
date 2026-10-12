@@ -599,8 +599,16 @@ fn check_quorum<C: Crypto>(
 
 // ---------------------------------------------------------------- decoding helpers
 
+/// The one place decoding limits live. `decode` and the incremental tx-set walk
+/// must never be able to drift apart — a walk with looser bounds would be a
+/// weaker parser than the one it replaced, and the difference would only show
+/// up on a crafted input.
+pub(crate) fn reader_for(bytes: &[u8]) -> Limited<Cursor<&[u8]>> {
+    Limited::new(Cursor::new(bytes), Limits { depth: 64, len: bytes.len() })
+}
+
 pub(crate) fn decode<T: ReadXdr>(bytes: &[u8]) -> Result<T, stellar_xdr::Error> {
-    let mut reader = Limited::new(Cursor::new(bytes), Limits { depth: 64, len: bytes.len() });
+    let mut reader = reader_for(bytes);
     T::read_xdr_to_end(&mut reader)
 }
 
@@ -684,7 +692,11 @@ fn parse_generalized_capped(
     bytes: &[u8],
     cap: usize,
 ) -> Result<Option<(SetKind, Hash, Vec<TransactionEnvelope>)>, Error> {
-    let mut r = Limited::new(bytes, Limits::none());
+    // Same reader `decode` builds, so the walk cannot be a weaker parser than
+    // the full one. `TransactionEnvelope` carries
+    // `InvokeHostFunction -> HostFunction -> ScVal`, a recursive union; without
+    // the depth bound a crafted set could recurse arbitrarily deep.
+    let mut r = reader_for(bytes);
     // `GeneralizedTransactionSet::VARIANTS == [1]`: the union carries its
     // version in the discriminant, so `V1` is 1, not 0. A legacy
     // `TransactionSet` opens with its `previous_ledger_hash`, so this is the
