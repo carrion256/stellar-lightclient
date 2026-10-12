@@ -510,3 +510,59 @@ fn risc0_receipt_binds_the_wrapper_identity() {
     assert!(!call(good_root, [0u8; 32]), "zero control id is not a default");
     assert!(!call([0u8; 32], good_id), "zero control root is not a default");
 }
+
+/// The pinned entry point takes no wrapper identity: it can only ever accept
+/// statements proven under the build's own pins. The fixture — a genuine
+/// upstream receipt — is the ground truth for those pins, so the digest
+/// equalities double as a release-drift guard: a verification-crate bump that
+/// moves the pair fails here until it is deliberately re-pinned (AGENTS.md).
+#[test]
+fn pinned_receipt_entry_uses_the_audited_wrapper_identity() {
+    let env = Env::default();
+    let f = risc0_fixture();
+    assert_eq!(hex_bytes(&f["control_root"]), groth16_core::risc0::RISC0_CONTROL_ROOT);
+    assert_eq!(
+        hex_bytes(&f["bn254_control_id"]),
+        groth16_core::risc0::RISC0_BN254_CONTROL_ID
+    );
+    assert!(
+        StellarVerifier::verify_risc0_receipt_pinned(
+            env.clone(),
+            BytesN::from_array(&env, &hex_bytes(&f["image_id"]).try_into().unwrap()),
+            Bytes::from_slice(&env, &hex_bytes(&f["journal"])),
+            Bytes::from_slice(&env, &hex_bytes(&f["seal"])),
+        ),
+        "the genuine receipt must verify through the pinned entry"
+    );
+}
+
+/// The pinned path fails closed on attacker-shaped input exactly like the
+/// generic one — pinning the constants does not pin the statement open.
+#[test]
+fn pinned_receipt_rejects_tampering() {
+    let env = Env::default();
+    let f = risc0_fixture();
+    let image: [u8; 32] = hex_bytes(&f["image_id"]).try_into().unwrap();
+    let seal = hex_bytes(&f["seal"]);
+    let journal = hex_bytes(&f["journal"]);
+    let mut tampered = seal.clone();
+    tampered[0] ^= 0x01;
+    assert!(
+        !StellarVerifier::verify_risc0_receipt_pinned(
+            env.clone(),
+            BytesN::from_array(&env, &image),
+            Bytes::from_slice(&env, &journal),
+            Bytes::from_slice(&env, &tampered),
+        ),
+        "tampered seal must be rejected through the pinned entry"
+    );
+    assert!(
+        !StellarVerifier::verify_risc0_receipt_pinned(
+            env.clone(),
+            BytesN::from_array(&env, &image),
+            Bytes::from_slice(&env, b"a different journal"),
+            Bytes::from_slice(&env, &seal),
+        ),
+        "wrong journal must be rejected through the pinned entry"
+    );
+}

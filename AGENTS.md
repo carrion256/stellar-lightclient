@@ -41,6 +41,9 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
   compare against in the deployment and the caller must compare them at
   integration time. The pair to compare against is `RISC0_CONTROL_ROOT` /
   `RISC0_BN254_CONTROL_ID` in `groth16_core::risc0`.
+  Soroban's `verify_risc0_receipt_pinned` applies this comparison inside the
+  contract; the generic `verify_risc0_receipt` still takes the pair as
+  arguments for callers deliberately targeting a different release.
 - OpenSSL headers + `pkg-config`, so `openssl-sys` (pulled in by near-workspaces)
   builds against nix's openssl instead of compiling from source.
 - `commit.gpgsign=false` for the session only, via `GIT_CONFIG_*` — this

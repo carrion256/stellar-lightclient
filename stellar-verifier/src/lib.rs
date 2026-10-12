@@ -173,6 +173,9 @@ impl StellarVerifier {
     /// against X at integration time. `AGENTS.md` records where those constants
     /// come from and when they must be re-pinned (any *verification* crate bump).
     ///
+    /// `verify_risc0_receipt_pinned` performs that comparison for you, inside
+    /// the contract.
+    ///
     /// Malformed input returns `false`; never traps.
     pub fn verify_risc0_receipt(
         env: Env,
@@ -200,5 +203,32 @@ impl StellarVerifier {
             return false;
         };
         groth16_core::risc0::verify(&ops, &proof, &public_inputs)
+    }
+
+    /// Pinned companion of [`verify_risc0_receipt`]: the control constants
+    /// come from this contract's compiled pins
+    /// (`groth16_core::risc0::RISC0_CONTROL_ROOT` / `RISC0_BN254_CONTROL_ID`),
+    /// never from the caller — so a production integration cannot be talked
+    /// into accepting a receipt proven under a *foreign* wrapper identity
+    /// (the pinned Groth16 key verifies any wrapper build's statement; only
+    /// the control pair identifies which one).
+    ///
+    /// Receipts from any other wrapper build verify `false` here. Callers
+    /// deliberately targeting a different RISC Zero release use
+    /// [`verify_risc0_receipt`] and pin the pair themselves.
+    pub fn verify_risc0_receipt_pinned(
+        env: Env,
+        image_id: BytesN<32>,
+        journal: Bytes,
+        seal: Bytes,
+    ) -> bool {
+        Self::verify_risc0_receipt(
+            env.clone(),
+            image_id,
+            journal,
+            seal,
+            BytesN::from_array(&env, &groth16_core::risc0::RISC0_CONTROL_ROOT),
+            BytesN::from_array(&env, &groth16_core::risc0::RISC0_BN254_CONTROL_ID),
+        )
     }
 }
