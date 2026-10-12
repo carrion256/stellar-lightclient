@@ -69,6 +69,19 @@ required-features = ["zkvm-entrypoint"]
 # against bincode-1 API code) and is not reproducible.
 [workspace]
 
+# The guest is its own workspace root, so the repository's `[profile.release]`
+# does not reach it and it was building with cargo's defaults: `codegen-units =
+# 16`, `lto = false`. Cycles are the entire cost model here, so build for
+# speed: full LTO with one codegen unit lets the verifier's call chain inline
+# across crate boundaries.
+#
+# `opt-level = 3`, not the repository's `"z"`: this binary is executed
+# instruction-by-instruction, so what matters is instruction count, not size.
+[profile.release]
+codegen-units = 1
+opt-level = 3
+lto = true
+
 # `ed25519-dalek`'s `curve25519-dalek` uses `crypto-bigint`'s `risc0` backend
 # when built for the zkVM, which the crates.io `crypto-bigint` does not provide.
 # RISC Zero's fork of `curve25519-dalek` expects this override — its own
