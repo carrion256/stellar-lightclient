@@ -132,13 +132,23 @@ fn build_inputs_hash() -> String {
     }
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
-    for dir in ["contract/src", "verifier/src", "verify-core/src"] {
+    for dir in [
+        "contract/src",
+        "verifier/src",
+        "verify-core/src",
+        // `contract` -> `verifier` -> `groth16-core`, so the wasm embeds four
+        // crates. Watching only three left a hole where a `groth16-core`-only
+        // edit passed a stale artifact — the exact silent failure this guard
+        // exists to prevent.
+        "groth16-core/src",
+    ] {
         collect(&workspace.join(dir), workspace, &mut inputs);
     }
     for manifest in [
         "contract/Cargo.toml",
         "verifier/Cargo.toml",
         "verify-core/Cargo.toml",
+        "groth16-core/Cargo.toml",
         "Cargo.toml",
         "Cargo.lock",
     ] {
@@ -191,32 +201,29 @@ fn read_wasm() -> Vec<u8> {
     //   * wasm rebuilt after a content change      -> pass, recording refreshed
     let sidecar = format!("{target_dir}/wasm32-unknown-unknown/release/.stellar_light_client.inputs.sha256");
     let input_hash = build_inputs_hash();
-    let ok_to_run = match (
+    match (
         std::fs::read_to_string(&sidecar),
         std::fs::metadata(&path).and_then(|m| m.modified()),
         std::fs::metadata(&sidecar).and_then(|m| m.modified()),
     ) {
-        (Ok(recorded), Ok(wasm_time), Ok(rec_time)) => {
-            if wasm_time > rec_time {
-                std::fs::write(&sidecar, &input_hash).expect("record build-input hash");
-                true
-            } else {
-                let fresh = recorded == input_hash;
-                assert!(
-                    fresh,
-                    "build inputs changed but the wasm at {path} was not rebuilt — rebuild first:\n\
-                     \x20 cargo build -p stellar-light-client --release --target wasm32-unknown-unknown"
-                );
-                true
-            }
+        (Ok(recorded), Ok(wasm_time), Ok(rec_time)) if wasm_time > rec_time => {
+            // The artifact is newer than the recording: a build happened since
+            // the last run, so this is a fresh artifact and the recording is
+            // refreshed to match its inputs.
+            std::fs::write(&sidecar, &input_hash).expect("record build-input hash");
+        }
+        (Ok(recorded), _, _) => {
+            assert_eq!(
+                recorded, input_hash,
+                "build inputs changed but the wasm at {path} was not rebuilt — rebuild first:\n\
+                 \x20 cargo build -p stellar-light-client --release --target wasm32-unknown-unknown"
+            );
         }
         // No recording yet: trust the artifact and start recording.
         _ => {
             std::fs::write(&sidecar, &input_hash).expect("record build-input hash");
-            true
         }
-    };
-    assert!(ok_to_run);
+    }
     std::fs::read(&path).unwrap_or_else(|e| {
         panic!(
             "wasm artifact not found at {path} ({e}); build it first with:\n\
