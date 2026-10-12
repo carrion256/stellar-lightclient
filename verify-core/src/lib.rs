@@ -66,13 +66,29 @@ pub struct Trust {
 
 /// Validate quorum configuration before processing any witness.
 pub fn validate_trust(trust: &Trust) -> Result<(), Error> {
-    if trust.threshold == 0 || trust.threshold as usize > trust.trusted_nodes.len() {
-        return Err(Error::InvalidTrust("threshold outside trusted node count"));
-    }
+    // Duplicate ids first: the most specific defect, and the one the fixture
+    // corpus asserts. Running the shape checks before it would mask it behind a
+    // threshold error for a set like `[[1;32],[1;32]]` at threshold 1.
     for (index, node) in trust.trusted_nodes.iter().enumerate() {
         if trust.trusted_nodes[..index].contains(node) {
             return Err(Error::InvalidTrust("duplicate trusted node"));
         }
+    }
+    if trust.threshold == 0 || trust.threshold as usize > trust.trusted_nodes.len() {
+        return Err(Error::InvalidTrust("threshold outside trusted node count"));
+    }
+    // Non-forkability floor. Two conflicting statements are both accepted only
+    // if two signer sets of size `threshold` can coexist without a shared
+    // honest member; they can be disjoint exactly when `2 * threshold <= len`.
+    // Below the strict majority, two halves of the trust set can each drive a
+    // different accepted head with no overlap at all — so this is a soundness
+    // property, not a weaker policy choice. How much of the mandatory overlap
+    // must be honest is the operator's adversary budget and is deliberately not
+    // decided here.
+    if trust.threshold as usize * 2 <= trust.trusted_nodes.len() {
+        return Err(Error::InvalidTrust(
+            "threshold must be a strict majority of trusted nodes",
+        ));
     }
     Ok(())
 }

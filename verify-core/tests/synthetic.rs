@@ -219,8 +219,14 @@ fn run<'a>(
     claims: &[(&'a [u8], u32)],
     threshold: u32,
 ) -> Result<SpanOutcome, Error> {
+    // Size the trust set to the threshold. A fixture that wants "one signature
+    // suffices" is describing a one-node set; handing `validate_trust` three
+    // nodes at threshold 1 is not a legal configuration (two disjoint halves of
+    // it could each push a different accepted head), so the ratio, not the
+    // fixture's intent, is what was wrong.
+    let trusted_nodes = c.trusted[..(threshold as usize).min(c.trusted.len())].to_vec();
     let trust =
-        Trust { network_id: NETWORK_ID, trusted_nodes: c.trusted.clone(), threshold, max_protocol_version: MAX_PROTOCOL };
+        Trust { network_id: NETWORK_ID, trusted_nodes, threshold, max_protocol_version: MAX_PROTOCOL };
     let proof = SpanProof {
         start_header: None,
         headers,
@@ -639,7 +645,7 @@ fn protocol_20_upgrade_on_pre_v20_predecessor_is_accepted() {
     let env = envelope(&key(0), 12, &value);
     let trust = Trust {
         network_id: NETWORK_ID,
-        trusted_nodes: c.trusted.clone(),
+        trusted_nodes: vec![c.trusted[0]],
         threshold: 1,
         max_protocol_version: 20,
     };

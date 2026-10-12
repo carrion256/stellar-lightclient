@@ -206,7 +206,7 @@ fn read_wasm() -> Vec<u8> {
         std::fs::metadata(&path).and_then(|m| m.modified()),
         std::fs::metadata(&sidecar).and_then(|m| m.modified()),
     ) {
-        (Ok(recorded), Ok(wasm_time), Ok(rec_time)) if wasm_time > rec_time => {
+        (Ok(_), Ok(wasm_time), Ok(rec_time)) if wasm_time > rec_time => {
             // The artifact is newer than the recording: a build happened since
             // the last run, so this is a fresh artifact and the recording is
             // refreshed to match its inputs.
