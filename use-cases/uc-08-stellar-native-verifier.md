@@ -205,7 +205,7 @@ there become real:
 - [x] The claim digest is derived by the contract, not accepted from the caller.
 - [ ] The pinned VK and `ReceiptClaim` digest match a freshly built seal's
       `bn254_control_id`.
-- [~] Measured cost per verification, published: **27,677,866 cpu insns /
+- [ ] **Partial:** measured cost per verification is published — **27,677,866 cpu insns /
       292,462 mem bytes** for the real receipt (26,280,240 / 281,607 for the
       toy circuit). The comparison to the NEAR baseline
       (`verifier/tests/risc0_verify.rs:116-120`) is still outstanding, and the
