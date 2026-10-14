@@ -148,6 +148,30 @@ pub fn verify_trusted_vk(
         return false;
     }
 
+    verify_trusted_vk_prescreened(ops, vk, proof, public_inputs)
+}
+
+/// [`verify_trusted_vk`] minus the proof-side guards, for a proof that has
+/// *already* passed them: shape/degeneracy, on-curve, prime-order subgroup.
+/// The only such proof is a [`crate::risc0::CheckedProof`], which
+/// [`crate::risc0::seal_to_proof`] mints after the decoder has applied those
+/// checks — repeating them here ran the G2 subgroup multiplication twice per
+/// receipt, the single largest wasm-side cost of the verifiers.
+///
+/// Crate-private on purpose: a raw [`Proof`] reaching the host unchecked
+/// **traps** it (NEAR `AltBn128InvalidInput`; the Soroban host likewise), so
+/// the only way to get here is through a type that proves the precondition.
+pub(crate) fn verify_trusted_vk_prescreened(
+    ops: &impl ProofOps,
+    vk: &VerifyingKey,
+    proof: &Proof,
+    public_inputs: &[Fr],
+) -> bool {
+    // Shape / degeneracy guards first — every branch below reaches the host.
+    if vk.ic.is_empty() || public_inputs.len() + 1 != vk.ic.len() {
+        return false;
+    }
+
     // π_l = IC[0] + Σ x_i · IC[i+1] — one host multiexp call.
     let scalars: Vec<Fr> = core::iter::once(Fr::from(1u64))
         .chain(public_inputs.iter().copied())
@@ -162,7 +186,6 @@ pub fn verify_trusted_vk(
         (vk.alpha_g1, -vk.beta_g2),
     ])
 }
-
 
 #[cfg(test)]
 mod tests {

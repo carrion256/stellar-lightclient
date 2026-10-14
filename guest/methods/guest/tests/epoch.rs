@@ -283,6 +283,102 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
     assert!(guest::run_epoch_bytes(&oversized).is_err());
 }
 
+/// The byte-buffer serde helpers on `SpanInput` are a decode-speed change
+/// only: the relayer serialises the same bytes it always did. This mirrors
+/// `EpochInput` with every payload as an ordinary `Vec<u8>` (serde's default
+/// shape, i.e. the pre-helper wire format) and requires bincode to emit the
+/// identical bytes — including the `Option` tags and empty buffers — and the
+/// guest to accept the mirror's output.
+#[test]
+fn span_input_wire_format_is_plain_serde_bytes() {
+    #[derive(serde::Serialize)]
+    struct PlainSpan {
+        start_header: Option<Vec<u8>>,
+        headers: Vec<Vec<u8>>,
+        tail_envelopes: Vec<Vec<u8>>,
+        tail_set: Option<Vec<u8>>,
+        claims: Vec<(Vec<u8>, u32)>,
+        outcome_claims: Vec<(Vec<u8>, Vec<u8>)>,
+        tail_results: Option<Vec<u8>>,
+    }
+    #[derive(serde::Serialize)]
+    struct PlainEpoch {
+        trust: Trust,
+        start_seq: u32,
+        start_hash: [u8; 32],
+        spans: Vec<PlainSpan>,
+    }
+    let plain = |input: &EpochInput| PlainEpoch {
+        trust: input.trust.clone(),
+        start_seq: input.start_seq,
+        start_hash: input.start_hash,
+        spans: input
+            .spans
+            .iter()
+            .map(|s| PlainSpan {
+                start_header: s.start_header.clone(),
+                headers: s.headers.clone(),
+                tail_envelopes: s.tail_envelopes.clone(),
+                tail_set: s.tail_set.clone(),
+                claims: s.claims.clone(),
+                outcome_claims: s.outcome_claims.clone(),
+                tail_results: s.tail_results.clone(),
+            })
+            .collect(),
+    };
+
+    let fixture = fixture();
+    let input = epoch_input(&fixture);
+    let ours = bincode::serialize(&input).unwrap();
+    let theirs = bincode::serialize(&plain(&input)).unwrap();
+    assert_eq!(ours, theirs, "the fixture epoch must serialise identically");
+    guest::run_epoch_bytes(&theirs).expect("plain-serde bytes must decode in the guest");
+
+    // Force every shape the helpers special-case: Some/None on each optional
+    // field, an empty buffer, an empty list, and non-empty claim lists.
+    let mut shaped = input;
+    let span = &mut shaped.spans[0];
+    span.start_header = Some(vec![1, 2, 3]);
+    span.tail_set = None;
+    span.tail_results = Some(Vec::new());
+    span.headers = Vec::new();
+    span.tail_envelopes = vec![Vec::new(), vec![9; 5]];
+    span.claims = vec![(vec![7; 3], u32::MAX), (Vec::new(), 0)];
+    span.outcome_claims = vec![(vec![1], vec![2, 3]), (Vec::new(), Vec::new())];
+    assert_eq!(
+        bincode::serialize(&shaped).unwrap(),
+        bincode::serialize(&plain(&shaped)).unwrap(),
+        "every Option/empty shape must serialise identically"
+    );
+
+    // The decode side is what the helpers changed: every shape must survive
+    // a trip through the byte-buffer deserialiser unchanged.
+    let bytes = bincode::serialize(&shaped).unwrap();
+    let decoded: EpochInput = bincode::deserialize(&bytes).expect("shaped input must decode");
+    assert_eq!(bincode::serialize(&decoded).unwrap(), bytes, "decode must be lossless");
+}
+
+/// `run_epoch` decompresses the trust set once; `Sha256Dalek` does it per
+/// signature. The cache is a cycle optimisation and must never change a
+/// verdict — the journal on a valid epoch, the exact error on a forged one.
+#[test]
+fn trust_key_cache_does_not_change_verdicts() {
+    let fixture = fixture();
+    let input = epoch_input(&fixture);
+    let cached = guest::run_epoch(&input).expect("valid epoch");
+    let plain = guest::run_epoch_with(&Sha256Dalek, &input).expect("valid epoch");
+    assert_eq!(encode_journal(&cached), encode_journal(&plain));
+
+    let mut forged = input;
+    let envelope = &mut forged.spans[0].tail_envelopes[0];
+    let last = envelope.len() - 1;
+    envelope[last] ^= 1; // flips a signature byte
+    assert_eq!(
+        format!("{:?}", guest::run_epoch(&forged).unwrap_err()),
+        format!("{:?}", guest::run_epoch_with(&Sha256Dalek, &forged).unwrap_err()),
+    );
+}
+
 /// Execute the built guest ELF in the zkVM and report the cycle breakdown, and
 /// assert the accelerated and fallback paths compute the same journal.
 ///
@@ -297,26 +393,38 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
 /// Real fixture epoch (2 spans, 30 envelopes at threshold 30, 319 KB set):
 ///
 /// ```text
-/// 2 spans, 1 claim     73,097,352 cycles  (~80 segments)
-/// 2 spans, no claims   60,730,164
-/// 1 span,  no claim    30,589,574
-///   -> parse_tx_set    12,367,188   16.9% of total, 29% of the span carrying it
+/// 2 spans, 1 claim     26,142,193 cycles  (~80 segments)
+/// 2 spans, no claims   26,095,476
+/// 1 span,  no claim    13,592,653   (input decode + first span)
+///   -> second span     12,549,540   (incl. its parse)
+///   -> parse_tx_set        46,717   0.2% of total
 /// ```
 ///
-/// `parse_tx_set` is a **per-span constant**: it decodes every transaction in
-/// the set to serve any claim, so ~12.4M is paid whether there is one claim or
-/// many. Its share therefore moves with claim density, and the benefit of a
-/// cheaper parse is per span, not per claim.
+/// How the 2-span/1-claim total got here (same fixture, same procedure):
 ///
-/// What that 16.9% is *not*: it is not "the largest unaccelerated term". Other
-/// generic rv32im work is present in the same spans — the XDR decode of 30
-/// envelopes and 2 headers per span, plus bincode deserialisation of an
-/// `EpochInput` carrying both sets — and none of that is individually
-/// attributed. The one-span figure bounds the one-off input cost at well under
-/// 1M cycles, which argues against bincode being the lever, but that is an
-/// inference from two numbers, not a direct measurement.
+/// ```text
+/// 73,097,352   ed25519 verified one signature at a time; parse_tx_set 12.4M
+/// 35,780,000   batch verification, and parse_tx_set stops at the claimed index
+/// 26,142,193   byte-buffer input decode (-8.7M) + trust-set keys decompressed once (-0.9M)
+/// ```
 ///
-/// Also measured: whether the precompile swap does anything at all. Same ELF
+/// The input decode step corrects an earlier inference in this comment: the
+/// one-span figure was read as bounding input decode "well under 1M cycles",
+/// but bincode's default `Vec<u8>` path dispatches the seq visitor once per
+/// byte, and the 700 KB `EpochInput` made it the second-largest term. It is
+/// fixed by `serde(with = ...)` byte-buffer helpers on `SpanInput` that keep
+/// the wire format byte-identical
+/// (`span_input_wire_format_is_plain_serde_bytes`).
+///
+/// What remains is ed25519: 23.9M of the 26.1M (91%; `guest-stub` runs the same
+/// epoch in 2.29M), all inside dalek's batch verification over the accelerated
+/// precompiles, so the lever left is the trust threshold (policy), not code.
+/// Re-measure after any change to `SpanInput`, the crypto backend, or
+/// `verify_span`'s per-signature work.
+///
+/// Also measured, at the 73.1M-cycle revision (so the totals below predate
+/// batching and the input-decode fix; the ratio is the point): whether the
+/// precompile swap does anything at all. Same ELF
 /// build procedure, same input, twice — once with RISC Zero's accelerated
 /// `sha2`/`ed25519-dalek` forks, once with the crates.io originals:
 ///
@@ -347,9 +455,9 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
 /// `ed25519-dalek`'s verify path has stopped routing through the accelerated
 /// ops. Check the call site, not the manifest.
 ///
-/// What that leaves open no longer is. Running the same input through
-/// `guest-stub` — identical except `ed25519_verify` returns `true` — splits the
-/// cost exactly:
+/// At the 73.1M-cycle revision the remaining question was settled by running
+/// the same input through `guest-stub` — identical except `ed25519_verify`
+/// returns `true` — which split the cost exactly:
 ///
 /// ```text
 /// 2 spans, 1 claim        real 73,097,352    stub 24,349,893
@@ -368,12 +476,12 @@ fn encoded_epoch_input_is_bounded_and_rejects_trailing_bytes() {
 /// the precompiles; at ~812k cycles per verify it is still two thirds of the
 /// epoch.
 ///
-/// That changes the optimisation order. The byte-span walk's ceiling is
-/// `parse_tx_set` plus some of the 12M generic remainder — call it 30% at the
-/// very outside, and less once a walk to the claimed envelope is priced in.
-/// Meanwhile 66.7% is `threshold` ed25519 verifications, which is a trust-set
-/// parameter, not a code one. Further code optimisation on this path is
-/// bounded well below the thing that dominates it.
+/// That set the optimisation order, and the two steps taken since followed it:
+/// batch verification, then the `parse_tx_set` early exit and the input-decode
+/// fix, which moved the epoch from 73.1M to 26.1M cycles. What is left is the
+/// `threshold` ed25519 verifications themselves (~91% now), a trust-set
+/// parameter rather than a code one — further code optimisation on this path
+/// is bounded well below the thing that dominates it.
 #[test]
 #[ignore]
 fn zkvm_cycle_breakdown() {

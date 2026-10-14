@@ -186,7 +186,13 @@ impl StellarVerifier {
         bn254_control_id: BytesN<32>,
     ) -> bool {
         let ops = ops::SorobanBn254::new(&env);
-        let journal: Vec<u8> = journal.iter().collect();
+        // Bulk copy: `Bytes::iter()` delivers one host object per byte and
+        // allocates the Vec per-element; `copy_into_slice` is a single host
+        // call into an exactly-sized buffer. The journal is attacker-supplied
+        // data, so this scales with journal size.
+        let mut journal_buf = alloc::vec![0u8; journal.len() as usize];
+        journal.copy_into_slice(&mut journal_buf);
+        let journal = journal_buf.as_slice();
         let claim = groth16_core::claim::ok_claim(&ops, image_id.to_array(), &journal);
         let digest = groth16_core::claim::claim_digest(&ops, &claim);
         let Ok(public_inputs) = groth16_core::risc0::public_inputs(

@@ -81,19 +81,44 @@ pub fn verifying_key() -> VerifyingKey {
     }
 }
 
-/// Groth16-verify a decoded proof against the pinned RISC Zero verifying key.
+/// A [`Proof`] whose points `a`, `b`, `c` have been checked non-identity,
+/// on-curve and in the prime-order subgroup.
 ///
-/// Equivalent to `groth16::verify(ops, &risc0::verifying_key(), proof,
-/// public_inputs)` minus the per-call VK point re-validation: the key is a
-/// compile-time constant whose unchecked construction is asserted equal to
-/// the fully checked [`verifying_key()`] in `tests/risc0_verify.rs`, so
-/// skipping the checks saves 22 decimal parses plus the expensive G2
-/// subgroup arithmetic per receipt without changing any outcome.
-pub fn verify(ops: &impl ProofOps, proof: &Proof, public_inputs: &[Fr; 5]) -> bool {
-    groth16::verify_trusted_vk(ops, &pinned_vk_unchecked(), proof, public_inputs)
+/// The only constructor is [`seal_to_proof`], whose decoder applies those
+/// checks, so holding one is the proof of them: [`verify`] takes this type and
+/// can skip the guards [`groth16::verify_trusted_vk`] re-runs for a raw
+/// [`Proof`]. The field is private and there is no `From<Proof>`, so a
+/// caller cannot launder an unchecked proof into the fast path — a bad point
+/// reaching the host traps the transaction instead of returning `false`.
+#[derive(Clone, Debug)]
+pub struct CheckedProof(Proof);
+
+impl core::ops::Deref for CheckedProof {
+    type Target = Proof;
+    fn deref(&self) -> &Proof {
+        &self.0
+    }
 }
 
-/// Decode a raw 256-byte RISC Zero seal into a [`Proof`].
+/// Groth16-verify a decoded seal against the pinned RISC Zero verifying key.
+///
+/// Equivalent to `groth16::verify(ops, &risc0::verifying_key(), proof,
+/// public_inputs)` minus two redundancies: the per-call VK point
+/// re-validation (the key is a compile-time constant whose unchecked
+/// construction is asserted equal to the fully checked [`verifying_key()`] in
+/// `tests/risc0_verify.rs`, saving 22 decimal parses plus G2 subgroup
+/// arithmetic), and the proof-side point checks [`seal_to_proof`] already
+/// enforced (saving a second G2 subgroup multiplication). Neither changes
+/// any outcome.
+pub fn verify(ops: &impl ProofOps, proof: &CheckedProof, public_inputs: &[Fr; 5]) -> bool {
+    groth16::verify_trusted_vk_prescreened(ops, &pinned_vk_unchecked(), &proof.0, public_inputs)
+}
+
+/// Decode a raw 256-byte RISC Zero seal into a [`CheckedProof`].
+///
+/// Every point is rejected unless it is canonically encoded, finite,
+/// on-curve and in the prime-order subgroup (`g1_from_be_raw` /
+/// `g2_from_be_raw`), which is what makes the result a [`CheckedProof`].
 ///
 /// Layout (risc0-groth16-3.0.5/src/types.rs:69-103 `Seal::decode`):
 /// - `a`: bytes 0..64, G1 as `(x_BE, y_BE)`.
@@ -103,7 +128,7 @@ pub fn verify(ops: &impl ProofOps, proof: &Proof, public_inputs: &[Fr; 5]) -> bo
 ///   (risc0-groth16-3.0.5/src/lib.rs:118-132; swap introduced in
 ///   src/types.rs:117-120). We un-swap here so `Proof.b` is the real G2 point.
 /// - `c`: bytes 192..256, G1 as `(x_BE, y_BE)`.
-pub fn seal_to_proof(seal: &[u8]) -> Result<Proof, String> {
+pub fn seal_to_proof(seal: &[u8]) -> Result<CheckedProof, String> {
     // `Seal::SIZE` is `a(G1) ‖ b(G2) ‖ c(G1)`; the source returns an error on a
     // wrong length, so do the same. Sizes come from the shared layout rather
     // than magic numbers, so this and the encoders cannot drift apart.
@@ -126,12 +151,12 @@ pub fn seal_to_proof(seal: &[u8]) -> Result<Proof, String> {
         seal.get(i * SCALAR_SIZE..(i + 1) * SCALAR_SIZE)
             .ok_or_else(|| "seal: truncated field element".into())
     };
-    Ok(Proof {
+    Ok(CheckedProof(Proof {
         a: g1_from_be_raw([e(0)?, e(1)?]).map_err(|_| "seal a: invalid G1 point")?,
         b: g2_from_be_raw([[e(2)?, e(3)?], [e(4)?, e(5)?]])
             .map_err(|_| "seal b: invalid G2 point")?,
         c: g1_from_be_raw([e(6)?, e(7)?]).map_err(|_| "seal c: invalid G1 point")?,
-    })
+    }))
 }
 
 /// The `control_root` of the RISC Zero release this crate's pinned verifying key

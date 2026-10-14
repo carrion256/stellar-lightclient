@@ -97,6 +97,15 @@ It must stay `no_std`-clean and must never depend on `near-sdk` or
 owns its own point encoding: NEAR uses 32-byte little-endian coordinates,
 Soroban uses Ethereum-compatible big-endian.
 
+RISC Zero receipts reach `risc0::verify` only as a `CheckedProof`, whose sole
+constructor is `seal_to_proof`: its decoder rejects identity, off-curve and
+out-of-subgroup points, so `verify` skips re-running those guards (a second G2
+subgroup multiplication per receipt — ~40% of Soroban CPU, ~15% of NEAR gas). The
+type is the proof of that precondition: a bad point reaching the host traps the
+transaction rather than returning `false`, so never add a path that builds a
+`CheckedProof` without the decoder, and verify a raw `Proof` through
+`groth16::verify_trusted_vk`, which keeps every guard.
+
 The Docker guest builder needs network access to crates.io. For a locally
 installed `risc0` toolchain, the Nix shell's `rustc` must not shadow that
 toolchain during a native guest build:
