@@ -207,7 +207,6 @@ pub enum Error {
     InvalidSignatureLength { index: usize },
     InvalidValidatorSignature { index: usize },
     QuorumNotReached { signers: u32, threshold: u32 },
-    NoExternalizeStatement,
     TxSetHashMismatch,
     TxSetTooShort,
     InvalidTxSetXdr,
@@ -276,7 +275,6 @@ impl std::fmt::Display for Error {
             Error::QuorumNotReached { signers, threshold } => {
                 write!(f, "quorum threshold not met — {signers} of {threshold}")
             }
-            Error::NoExternalizeStatement => f.write_str("no externalize statement for ledger"),
             Error::TxSetHashMismatch => {
                 f.write_str("transaction set does not hash to the signed value")
             }
@@ -437,7 +435,11 @@ pub fn verify_span<C: Crypto>(
             let cap = proof
                 .claims
                 .iter()
-                .map(|(_, index)| *index as usize + 1)
+                // `saturating_add`, not `+ 1`: at u32::MAX the unchecked form
+                // overflows on a 32-bit target (the contract wasm) and traps.
+                // A saturated cap just decodes the whole set, and the claim
+                // range check below rejects the index with the honest error.
+                .map(|(_, index)| (*index as usize).saturating_add(1))
                 .max()
                 .unwrap_or(1);
             let (kind, prev, list) = parse_tx_set(set, cap)?;
@@ -561,7 +563,6 @@ fn check_quorum<C: Crypto>(
     envelopes: &[&[u8]],
 ) -> Result<(StellarValue, u32), Error> {
     let mut counted: Vec<[u8; 32]> = Vec::new();
-    let mut value: Option<StellarValue> = None;
     // Encoded once: every envelope must externalize exactly this, and the
     // header does not change across the loop.
     let expected_value_xdr = encode(&header.scp_value)?;
@@ -587,10 +588,6 @@ fn check_quorum<C: Crypto>(
         if value_bytes(&ext.commit.value) != expected_value_xdr {
             return Err(Error::ExternalizedValueMismatch { index });
         }
-        if value.is_none() {
-            value = Some(header.scp_value.clone());
-        }
-
         let PublicKey::PublicKeyTypeEd25519(key) = &statement.node_id.0;
         let node_id = key.0;
         if counted.contains(&node_id) {
@@ -653,8 +650,10 @@ fn check_quorum<C: Crypto>(
     if signers < trust.threshold {
         return Err(Error::QuorumNotReached { signers, threshold: trust.threshold });
     }
-    let value = value.ok_or(Error::NoExternalizeStatement)?;
-    Ok((value, signers))
+    // `signers >= threshold >= 1` (validate_trust rejects threshold 0) and
+    // every counted node passed the value check above, so the externalized
+    // value is necessarily the header's own SCP value.
+    Ok((header.scp_value.clone(), signers))
 }
 
 // ---------------------------------------------------------------- decoding helpers

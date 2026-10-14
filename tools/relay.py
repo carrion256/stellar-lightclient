@@ -4,9 +4,10 @@
 Consumes the proof JSON produced by the fixture fetcher
 (`cargo run -p xtask -- fetch-fixture`) and builds a *span* proof: one header per
 ledger, with a single quorum certificate and transaction set at the tail. The tail's
-certificate authenticates every ledger BEFORE the tail; the tail header itself is
-only pinned by the next submission from the stored checkpoint, or by its own tx set
-plus a supplied `start_header_xdr_b64` (claims always need that predecessor).
+signed transaction set pins the ledger BEFORE the tail — this is the authenticated
+head that the contract stores; the tail header itself is provisional and is pinned
+only by the next span's tail transaction set. `start_header_xdr_b64` is required
+only for single-header claims, where it must match the starting checkpoint.
 
 Two encodings:
   --format json   JSON + base64 args for `submit_span` (explorer/wallet friendly)

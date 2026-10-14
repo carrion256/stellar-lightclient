@@ -9,5 +9,6 @@
 # lockfile) because `cargo risczero build` compiles it standalone with
 # `--manifest-path ... --locked`. A nested workspace must be excluded here.
 [workspace]
+resolver = "2"
 members = ["methods"]
 exclude = ["methods/guest"]

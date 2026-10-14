@@ -131,8 +131,7 @@ fn run() -> Result<(), String> {
     let (ledgers, scp, txs, results) = fetch_checkpoint(&archive, checkpoint)?;
 
     // d. Pick the consecutive pair with the most total transactions.
-    let (seq_a, seq_b) =
-        select_pair(&ledgers, &scp, &txs).ok_or("no consecutive tx-bearing pair found")?;
+    let (seq_a, seq_b) = select_pair(&ledgers, &scp, &txs)?;
 
     // Build one close object per ledger, running all integrity assertions.
     let close_a = build_close(&ledgers, &scp, &txs, &results, seq_a, None)?;
@@ -373,7 +372,7 @@ fn select_pair(
     ledgers: &[LedgerHeaderHistoryEntry],
     scp: &[ScpHistoryEntry],
     txs: &[TransactionHistoryEntry],
-) -> Option<(u32, u32)> {
+) -> Result<(u32, u32), String> {
     // A claim-bearing first close needs its predecessor (seq-1) present in
     // the checkpoint file; the file's first ledger has none. The checkpoint's
     // ledgers are contiguous from `ledgers[0]`, so the predecessor exists exactly
@@ -385,14 +384,19 @@ fn select_pair(
     let mut best: Option<(usize, u32)> = None; // (total txs, seq)
     for pair in ledgers.windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
-        if b.header.ledger_seq != a.header.ledger_seq + 1 {
+        let next = a
+            .header
+            .ledger_seq
+            .checked_add(1)
+            .ok_or("ledger sequence u32::MAX + 1 overflows u32")?;
+        if b.header.ledger_seq != next {
             continue;
         }
         let seq = a.header.ledger_seq;
         if seq <= min_seq {
             continue;
         }
-        let (Some(ta), Some(tb)) = (tx_by_seq.get(&seq), tx_by_seq.get(&(seq + 1))) else {
+        let (Some(ta), Some(tb)) = (tx_by_seq.get(&seq), tx_by_seq.get(&next)) else {
             continue;
         };
         let ca = tx_count(ta);
@@ -415,7 +419,8 @@ fn select_pair(
             best = Some((ca + cb, seq));
         }
     }
-    best.map(|(_, seq)| (seq, seq + 1))
+    let (_, seq) = best.ok_or("no consecutive tx-bearing pair found")?;
+    Ok((seq, seq.checked_add(1).ok_or("ledger sequence u32::MAX + 1 overflows u32")?))
 }
 
 /// A slot certificate is usable only if its own envelopes externalize and

@@ -5,8 +5,9 @@
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey, Signature as DalekSignature};
 use stellar_xdr::{
-    BumpSequenceOp, EnvelopeType, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerUpgrade,
-    Limited, Limits, MuxedAccount, NodeId, Operation, OperationBody, PublicKey, ReadXdr,
+    BumpSequenceOp, DependentTxCluster, EnvelopeType, GeneralizedTransactionSet, Hash,
+    LedgerHeader, LedgerUpgrade, Limited, Limits, MuxedAccount, NodeId, Operation,
+    OperationBody, ParallelTxsComponent, ParallelTxExecutionStage, PublicKey, ReadXdr,
     ScpBallot, ScpEnvelope, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
     SequenceNumber, Signature, StellarValue, TransactionEnvelope, TransactionPhase, TransactionSet,
     TransactionSetV1, TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
@@ -127,6 +128,8 @@ fn txs() -> (Vec<u8>, Vec<u8>) {
 #[derive(Clone, Copy)]
 enum SetKind {
     Generalized,
+    /// Generalized set whose single phase uses the V1 parallel layout.
+    Parallel,
     Legacy,
 }
 
@@ -145,6 +148,30 @@ fn tx_set_bytes(prev: [u8; 32], kind: SetKind, tx0: &TransactionEnvelope, tx1: &
                 .unwrap(),
             }))
         }
+        SetKind::Parallel => encode_xdr(&GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(prev),
+            // Stage 0 carries tx0, stage 1 carries tx1: serialization order
+            // (stage -> cluster -> envelope) fixes flattened index 0 and 1.
+            phases: VecM::try_from(vec![TransactionPhase::V1(ParallelTxsComponent {
+                base_fee: None,
+                execution_stages: VecM::try_from(vec![
+                    ParallelTxExecutionStage(
+                        VecM::try_from(vec![DependentTxCluster(
+                            VecM::try_from(vec![tx0.clone()]).unwrap(),
+                        )])
+                        .unwrap(),
+                    ),
+                    ParallelTxExecutionStage(
+                        VecM::try_from(vec![DependentTxCluster(
+                            VecM::try_from(vec![tx1.clone()]).unwrap(),
+                        )])
+                        .unwrap(),
+                    ),
+                ])
+                .unwrap(),
+            })])
+            .unwrap(),
+        })),
         SetKind::Legacy => encode_xdr(&TransactionSet {
             previous_ledger_hash: Hash(prev),
             txs: VecM::try_from(vec![tx0.clone(), tx1.clone()]).unwrap(),
@@ -187,7 +214,7 @@ fn chain(start_seq: u32, start_hash: [u8; 32], tail_seq: u32, kind: SetKind) -> 
         tx_set_hash: Hash(match kind {
             // stellar-core: generalized hashes the whole XDR; legacy hashes
             // prev || envelopes without the vector count.
-            SetKind::Generalized => TestCrypto.sha256(&tail_set),
+            SetKind::Generalized | SetKind::Parallel => TestCrypto.sha256(&tail_set),
             SetKind::Legacy => legacy_tx_set_contents_hash(&TestCrypto, &tail_set).unwrap(),
         }),
         close_time: stellar_xdr::TimePoint(1),
@@ -329,8 +356,8 @@ fn quorum_threshold_met_and_not_met() {
     assert_eq!(err, Error::QuorumNotReached { signers: 3, threshold: 4 });
 }
 
-// Deleting the dedup guard (`counted.contains`, lib.rs:408) lets the same
-// node's second vote count twice: 2 ≥ threshold 2 → Ok, and this test's
+// Deleting the dedup guard (`counted.contains` in `check_quorum`) lets the
+// same node's second vote count twice: 2 ≥ threshold 2 → Ok, and this test's
 // `unwrap_err` fails.
 #[test]
 fn duplicate_votes_count_once() {
@@ -342,10 +369,10 @@ fn duplicate_votes_count_once() {
     assert_eq!(err, Error::QuorumNotReached { signers: 1, threshold: 2 });
 }
 
-// Deleting the trust guard (`!trusted_nodes.contains`, lib.rs:411) lets the
-// untrusted vote count — its signature is valid for the tail slot/value, so
-// only the trust check rejects it; without the guard 2 ≥ threshold 2 → Ok and
-// this test's `unwrap_err` fails.
+// Deleting the trust guard (`!trusted_nodes.contains` in `check_quorum`) lets
+// the untrusted vote count — its signature is valid for the tail slot/value,
+// so only the trust check rejects it; without the guard 2 ≥ threshold 2 → Ok
+// and this test's `unwrap_err` fails.
 #[test]
 fn untrusted_signer_does_not_count_toward_quorum() {
     let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
@@ -475,6 +502,25 @@ fn claims_proven_index_checks() {
 }
 
 #[test]
+fn maximal_claim_index_is_out_of_range_not_a_trap() {
+    // `tx_index` is attacker-controlled u32. The cap computation saturates
+    // instead of overflowing at u32::MAX, so the whole set is decoded and the
+    // claim dies on the range check with the honest error — the contract wasm
+    // is a 32-bit target where `u32::MAX as usize + 1` would trap.
+    let c = chain(10, [5u8; 32], 12, SetKind::Generalized);
+    let err = run(
+        &c,
+        &refs(&c.headers),
+        &refs(&c.envelopes),
+        Some(&c.tail_set),
+        &[(&c.tx0[..], u32::MAX)],
+        3,
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::ClaimIndexOutOfRange { claim: 0, index: u32::MAX, len: 2 });
+}
+
+#[test]
 fn claim_without_tx_set_is_rejected() {
     let c = chain(11, [5u8; 32], 12, SetKind::Generalized);
     let err =
@@ -526,10 +572,10 @@ fn forged_link_headers(c: &Chain) -> Vec<Vec<u8>> {
 // stored authenticated_head is the tail set's previousLedgerHash equaling the
 // hash of the penultimate header actually supplied. Here the honestly-signed
 // tail set pins the REAL penultimate while the chain walks over a forged one.
-// Fast-path guard: `tx_set_kind_prev` (lib.rs:481-498). Claims-path guard:
-// `prev.0 != pinned_by_set` (lib.rs:326-328). Delete either comparison and
-// this span verifies Ok — this test then fails. The error below is reachable
-// only through those two pin comparisons.
+// Fast-path guard: `tx_set_kind_prev`. Claims-path guard: the
+// `prev.0 != pinned_by_set` comparison in `verify_span`. Delete either
+// comparison and this span verifies Ok — this test then fails. The error
+// below is reachable only through those two pin comparisons.
 #[test]
 fn generalized_tail_set_must_pin_the_supplied_penultimate() {
     let c = chain(10, [5u8; 32], 12, SetKind::Generalized);
@@ -546,9 +592,8 @@ fn generalized_tail_set_must_pin_the_supplied_penultimate() {
 
 // #6 (legacy): the same attack against the legacy encoding; the honest legacy
 // set pins the real penultimate, the chain supplies a forged one. Guards:
-// `tx_set_kind_prev` (lib.rs:481-498) fast path, `prev.0 != pinned_by_set`
-// (lib.rs:326-328) claims path — delete either comparison and this test
-// fails.
+// `tx_set_kind_prev` (fast path), `prev.0 != pinned_by_set` (claims path in
+// `verify_span`) — delete either comparison and this test fails.
 #[test]
 fn legacy_tail_set_must_pin_the_supplied_penultimate() {
     let c = chain(10, [5u8; 32], 12, SetKind::Legacy);
@@ -943,4 +988,50 @@ fn legacy_set_with_claims_verifies_through_the_same_hash() {
             vec![TestCrypto.sha256(&c.tx0), TestCrypto.sha256(&c.tx1)]
         );
     }
+}
+
+// #6 (V1 parallel phase): the phase carries stages of dependent-tx clusters
+// instead of the V0 flat component. `parse_generalized_capped` flattens
+// stage -> cluster -> envelope in serialization order, so claim index i must
+// resolve to the i-th envelope in that order — identical to what a V0 phase
+// over the same envelopes yields.
+#[test]
+fn generalized_v1_parallel_phase_flattens_in_serialization_order() {
+    let c = chain(10, [5u8; 32], 12, SetKind::Parallel);
+    // tx0 staged first, tx1 staged second: both claims verify in order.
+    let outcome = run(
+        &c,
+        &refs(&c.headers),
+        &refs(&c.envelopes),
+        Some(&c.tail_set),
+        &[(&c.tx0[..], 0u32), (&c.tx1[..], 1u32)],
+        3,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.claim_ids,
+        vec![TestCrypto.sha256(&c.tx0), TestCrypto.sha256(&c.tx1)]
+    );
+    // Each envelope is pinned to exactly its flattened index: swapped claims
+    // fail, so any change to the V1 flatten order breaks one of the checks.
+    let err = run(
+        &c,
+        &refs(&c.headers),
+        &refs(&c.envelopes),
+        Some(&c.tail_set),
+        &[(&c.tx1[..], 0u32)],
+        3,
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::ClaimEnvelopeMismatch { claim: 0, index: 0 });
+    let err = run(
+        &c,
+        &refs(&c.headers),
+        &refs(&c.envelopes),
+        Some(&c.tail_set),
+        &[(&c.tx0[..], 1u32)],
+        3,
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::ClaimEnvelopeMismatch { claim: 0, index: 1 });
 }

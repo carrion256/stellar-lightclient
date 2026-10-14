@@ -125,7 +125,7 @@ fn groth16_fixture_verifies_on_the_soroban_host() {
     // separately in `risc0_receipt_verifies_end_to_end` — different program,
     // different number. Soroban meters cpu insns and memory separately from
     // NEAR's gas, so neither figure is comparable to `submit_span`'s Tgas.
-    let b = env.budget();
+    let b = env.cost_estimate().budget();
     println!(
         "soroban verify: {} cpu insns, {} mem bytes",
         b.cpu_instruction_cost(),
@@ -406,7 +406,7 @@ fn risc0_receipt_verifies_end_to_end() {
     assert!(result, "upstream RISC Zero receipt must verify");
     // The real RISC Zero receipt's cost — not the toy Groth16 circuit's, which
     // is a different number and a different program.
-    let b = env.budget();
+    let b = env.cost_estimate().budget();
     println!(
         "soroban verify_risc0_receipt: {} cpu insns, {} mem bytes",
         b.cpu_instruction_cost(),

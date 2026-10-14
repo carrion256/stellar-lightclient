@@ -580,8 +580,9 @@ impl LightClient {
     /// (`Halted(0)`) committing exactly `journal`. This is not the epoch-bound
     /// entry point; consumers must check `image_id` themselves.
     ///
-    /// Panics only on malformed input lengths; a bad proof returns
-    /// `verified: false`.
+    /// Panics on malformed lengths and on an unpinned wrapper (when
+    /// `control_root` or `bn254_control_id` does not match the pinned pair);
+    /// a bad proof returns `verified: false`.
     pub fn verify_receipt(
         &self,
         seal: Base64VecU8,
@@ -735,7 +736,7 @@ impl LightClient {
     }
 
     /// The non-cryptographic bindings a journal must satisfy for this contract
-    /// to treat a receipt over it as candidate evidence: canonical v1 decode,
+    /// to treat a receipt over it as candidate evidence: canonical v2 decode,
     /// the current trust policy digest, the stored checkpoint as the epoch
     /// start, and a coherent epoch end. Returns the decoded journal only when
     /// every binding holds *and* the claimed claim digest equals the digest of

@@ -101,16 +101,15 @@ async fn view_json(contract: &Contract, method: &str) -> Value {
     }
 }
 
-/// SHA-256 over `(relative path, content hash)` for every wasm build input.
+/// Every file the freshness guard hashes: `(relative path, absolute path)`.
 ///
 /// Replaces the old `latest_build_input` mtime walk. Content hashing is what
 /// makes the freshness check robust to `cargo` touching `Cargo.lock` without
 /// changing anything that feeds the contract — the false positive that fired
-/// repeatedly. Same input set as before: the three local source trees plus the
-/// five manifests, minus this test module which is not a wasm input.
-fn build_inputs_hash() -> String {
-    use sha2::{Digest, Sha256};
-    fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+/// repeatedly. Same input set as before: the four local source trees plus the
+/// workspace manifests, minus this test module which is not a wasm input.
+fn build_inputs() -> Vec<(String, std::path::PathBuf)> {
+    fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, std::path::PathBuf)>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -120,18 +119,18 @@ fn build_inputs_hash() -> String {
             }
             if path.is_dir() {
                 collect(&path, root, out);
-            } else if let Ok(bytes) = std::fs::read(&path) {
+            } else {
                 let key = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                out.push((key, bytes));
+                out.push((key, path));
             }
         }
     }
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut inputs: Vec<(String, std::path::PathBuf)> = Vec::new();
     for dir in [
         "contract/src",
         "verifier/src",
@@ -153,17 +152,25 @@ fn build_inputs_hash() -> String {
         "Cargo.lock",
     ] {
         let path = workspace.join(manifest);
-        if let Ok(bytes) = std::fs::read(&path) {
-            inputs.push((manifest.to_string(), bytes));
+        if path.is_file() {
+            inputs.push((manifest.to_string(), path));
         }
     }
     // Sort so directory traversal order cannot change the digest.
     inputs.sort_by(|a, b| a.0.cmp(&b.0));
+    inputs
+}
+
+/// SHA-256 over `(relative path, content hash)` for every wasm build input.
+fn build_inputs_hash() -> String {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for (name, bytes) in &inputs {
-        hasher.update(name.as_bytes());
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
+    for (name, path) in &build_inputs() {
+        if let Ok(bytes) = std::fs::read(path) {
+            hasher.update(name.as_bytes());
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        }
     }
     format!("{:x}", hasher.finalize())
 }
@@ -188,17 +195,20 @@ fn read_wasm() -> Vec<u8> {
     // tests an old contract (calls to newer methods trap with no logs).
     //
     // Freshness binds the artifact to the *content* of every build input —
-    // this crate and its local path dependencies (`verifier`, `verify-core`)
-    // including all their sources and manifests, plus the workspace root
-    // Cargo.toml/Cargo.lock. Comparing mtimes instead is what made this fire
-    // spuriously: any unrelated `cargo` invocation re-touches `Cargo.lock`, so
-    // a correct build looked stale roughly every other run.
+    // this crate and its local path dependencies (`verifier` — which depends
+    // on `groth16-core` — and `verify-core`) including all their sources and
+    // manifests, plus the workspace root Cargo.toml/Cargo.lock. Comparing
+    // mtimes instead is what made this fire spuriously: any unrelated `cargo`
+    // invocation re-touches `Cargo.lock`, so a correct build looked stale
+    // roughly every other run.
     //
-    // The recorded hash is refreshed whenever the wasm is newer than the
-    // recording, which is what a rebuild looks like from here. So:
+    // The recorded hash is refreshed when the wasm is newer than the
+    // recording *and* no build input is newer than the wasm — i.e. only when
+    // the artifact really was built from the current inputs. So:
     //   * input content changed, wasm not rebuilt  -> fail (the real case)
     //   * input content unchanged, mtimes churned  -> pass (was the false positive)
     //   * wasm rebuilt after a content change      -> pass, recording refreshed
+    //   * wasm rebuilt, then an input was edited   -> fail (stale artifact)
     let sidecar = format!("{target_dir}/wasm32-unknown-unknown/release/.stellar_light_client.inputs.sha256");
     let input_hash = build_inputs_hash();
     match (
@@ -208,8 +218,21 @@ fn read_wasm() -> Vec<u8> {
     ) {
         (Ok(_), Ok(wasm_time), Ok(rec_time)) if wasm_time > rec_time => {
             // The artifact is newer than the recording: a build happened since
-            // the last run, so this is a fresh artifact and the recording is
-            // refreshed to match its inputs.
+            // the last run. That alone does not make it fresh — `edit ->
+            // build -> edit` leaves exactly this mtime picture with a stale
+            // wasm — so only trust it when no build input is newer than the
+            // artifact itself.
+            let stale = build_inputs().iter().any(|(_, path)| {
+                std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t > wasm_time)
+                    .unwrap_or(false)
+            });
+            assert!(
+                !stale,
+                "build inputs changed but the wasm at {path} was not rebuilt — rebuild first:\n\
+                 \x20 cargo build -p stellar-light-client --release --target wasm32-unknown-unknown"
+            );
             std::fs::write(&sidecar, &input_hash).expect("record build-input hash");
         }
         (Ok(recorded), _, _) => {
@@ -643,7 +666,7 @@ async fn e2e_verify_claim_rejects_foreign_policy_journal() -> anyhow::Result<()>
     let (contract, f) = deploy_light_client(&worker).await;
     let (head_seq, head_hash, network_id, trusted_nodes, threshold, image_id) = client_epoch_inputs(&f);
     let mut journal = epoch_journal_for(&network_id, &trusted_nodes, threshold, head_seq, head_hash);
-    journal[76] ^= 0x01; // corrupt the v1 policy_digest: same encoding, foreign policy
+    journal[76] ^= 0x01; // corrupt the v2 policy_digest: same encoding, foreign policy
     let claim_digest = epoch_claim_digest(image_id, &journal);
 
     let outcome = contract

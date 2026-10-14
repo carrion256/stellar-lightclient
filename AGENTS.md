@@ -62,7 +62,7 @@ shell, or nix will report it as missing. Lockfile changes require re-adding.
 | NEAR contract wasm | `cargo build -p stellar-light-client --release --target wasm32-unknown-unknown` |
 | Soroban contract wasm | `stellar contract build --manifest-path stellar-verifier/Cargo.toml` |
 | zkVM guest toolchain | `risc0-setup` |
-| build guest program (does not prove a receipt) | `cargo risczero build --manifest-path guest/Cargo.toml --features zkvm-entrypoint` |
+| build guest program (does not prove a receipt) | `cargo risczero build --manifest-path guest/methods/guest/Cargo.toml --features zkvm-entrypoint` |
 | fetch and authenticate a fixture | `cargo run -p xtask -- fetch-fixture --checkpoint 64822015 --out /tmp/stellar-fixture.json` |
 | prepare raw-Borsh calldata | `python3 tools/relay.py --proof testdata/fixture.json --contract lc.testnet --format borsh --dry-run --output /tmp/span.borsh` |
 
@@ -105,7 +105,7 @@ toolchain during a native guest build:
 RUSTC="$(rustup which --toolchain risc0 rustc)" \
 RUSTDOC="$(rustup which --toolchain risc0 rustdoc)" \
 CARGO_TARGET_RISCV32IM_RISC0_ZKVM_ELF_RUSTFLAGS='--cfg getrandom_backend="custom" -C link-arg=-Ttext=0x00200800' \
-rustup run risc0 cargo build --manifest-path guest/Cargo.toml \
+rustup run risc0 cargo build --manifest-path guest/methods/guest/Cargo.toml \
   --release --locked --target riscv32im-risc0-zkvm-elf --features zkvm-entrypoint
 ```
 

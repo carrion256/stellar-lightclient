@@ -29,8 +29,8 @@ in
     # Version relationship to the pinned verifying key:
     #   tooling       risc0-zkvm 3.0.6        (executor/prover; builds the guest)
     #   verification  risc0-groth16 3.0.5, risc0-binfmt 3.0.5, risc0-zkp 3.0.5
-    #                 (the VK transcribed into verifier/src/risc0.rs and the
-    #                  ReceiptClaim digest reproduced in verifier/src/claim.rs
+    #                 (the VK transcribed into groth16-core/src/risc0.rs and the
+    #                  ReceiptClaim digest reproduced in groth16-core/src/claim.rs
     #                  come from these)
     # The verification-side crates did not move between 3.0.5 and 3.0.6, so the
     # wrapper identity is expected to be unchanged. The definitive check — after
@@ -117,6 +117,6 @@ in
     rzup use rust ${risc0RustToolchain}
     echo
     echo "done. Build the guest program (receipt proving is a separate step):"
-    echo "  cargo risczero build --manifest-path guest/Cargo.toml --features zkvm-entrypoint"
+    echo "  cargo risczero build --manifest-path guest/methods/guest/Cargo.toml --features zkvm-entrypoint"
   '';
 }

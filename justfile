@@ -69,14 +69,14 @@ guest: docker-shim
 
 # Build the loose guest ELF without embedding, using the risc0 CLI.
 guest-elf: docker-shim
-    {{risc0_env}} cargo risczero build --manifest-path guest/Cargo.toml --features zkvm-entrypoint
+    {{risc0_env}} cargo risczero build --manifest-path guest/methods/guest/Cargo.toml --features zkvm-entrypoint
 
 # Build the guest natively with the local risc0 toolchain, without Docker.
 guest-native:
     RUSTC="$(rustup which --toolchain risc0 rustc)" \
     RUSTDOC="$(rustup which --toolchain risc0 rustdoc)" \
     CARGO_TARGET_RISCV32IM_RISC0_ZKVM_ELF_RUSTFLAGS='--cfg getrandom_backend="custom" -C link-arg=-Ttext=0x00200800' \
-    rustup run risc0 cargo build --manifest-path guest/Cargo.toml \
+    rustup run risc0 cargo build --manifest-path guest/methods/guest/Cargo.toml \
         --release --locked --target riscv32im-risc0-zkvm-elf --features zkvm-entrypoint
 
 # ── test ─────────────────────────────────────────────────────────────────────
