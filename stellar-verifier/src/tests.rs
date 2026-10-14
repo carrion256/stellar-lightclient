@@ -566,3 +566,138 @@ fn pinned_receipt_rejects_tampering() {
         "wrong journal must be rejected through the pinned entry"
     );
 }
+
+/// The genuine fixture's seal with its `b` (bytes 64..192) replaced. A G2 point
+/// in this contract's wire order (`x.c1 ‖ x.c0 ‖ y.c1 ‖ y.c0`, big-endian) is
+/// byte-for-byte the seal's `b` layout, so `g2_to_wire` output drops straight in.
+fn fixture_seal_with_b(b: &[u8; 128]) -> Vec<u8> {
+    let mut seal = hex_bytes(&risc0_fixture()["seal"]);
+    seal[64..192].copy_from_slice(b);
+    seal
+}
+
+fn pinned_verdict(env: &Env, seal: &[u8]) -> bool {
+    let f = risc0_fixture();
+    StellarVerifier::verify_risc0_receipt_pinned(
+        env.clone(),
+        BytesN::from_array(env, &hex_bytes(&f["image_id"]).try_into().unwrap()),
+        Bytes::from_slice(env, &hex_bytes(&f["journal"])),
+        Bytes::from_slice(env, seal),
+    )
+}
+
+/// A genuine on-curve G2 point *outside* the prime-order subgroup (same
+/// deterministic search as `verifier/tests/risc0_verify.rs`): candidates
+/// `(x, y)` from `get_point_from_x_unchecked`, first non-identity hit.
+fn wrong_subgroup_g2() -> G2 {
+    for i in 1u64..64 {
+        let p = G2::get_point_from_x_unchecked(
+            ark_bn254::Fq2::new(ark_bn254::Fq::from(i), ark_bn254::Fq::from(0u64)),
+            false,
+        );
+        if let Some(p) = p {
+            if !p.infinity && p.is_on_curve() && !p.is_in_correct_subgroup_assuming_on_curve() {
+                return p;
+            }
+        }
+    }
+    panic!("deterministic wrong-subgroup G2 search failed");
+}
+
+/// The one input class that traps. The receipt entry points leave `b`'s
+/// prime-order-subgroup check to the host's `pairing_check`
+/// (`HostChecksG2Subgroup`), which aborts on a point outside it — cheaper by
+/// ~80M instructions than doing the multiplication in wasm, at the price of a
+/// trap where the old contract returned `false`.
+///
+/// Three things are pinned: the trap happens (so a future SDK/host that quietly
+/// stopped validating G2 fails here instead of silently accepting), it happens
+/// on both entry points, and it is attributable to the host — the two decoders
+/// disagree on exactly this seal, so the wasm side did not reject it first.
+#[test]
+fn wrong_subgroup_b_traps_in_the_host_and_never_verifies() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let seal = fixture_seal_with_b(&g2_to_wire(&wrong_subgroup_g2()));
+
+    assert!(
+        groth16_core::risc0::seal_to_proof(&seal).is_err(),
+        "the fully checked decoder rejects it, so only the deferral lets it through"
+    );
+    assert!(
+        groth16_core::risc0::seal_to_proof_host_checked(&seal).is_ok(),
+        "the host-checked decoder must hand it to the host"
+    );
+
+    // The panic payload carries the host's diagnostic events, so assert *why* it
+    // aborted: any other panic (a wasm-side bug, an unrelated host error) must
+    // not satisfy this test.
+    let trap_message = |outcome: std::thread::Result<bool>| -> String {
+        match outcome {
+            Ok(verdict) => panic!("expected the host to abort, got verdict {verdict}"),
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        }
+    };
+    let is_subgroup_rejection = |m: &str| {
+        m.contains("Error(Crypto, InvalidInput)") && m.contains("point not in the correct subgroup")
+    };
+
+    let env = Env::default();
+    let pinned = trap_message(catch_unwind(AssertUnwindSafe(|| pinned_verdict(&env, &seal))));
+    assert!(
+        is_subgroup_rejection(&pinned),
+        "pinned entry must abort with the host's G2 subgroup rejection, got: {pinned}"
+    );
+
+    let f = risc0_fixture();
+    let generic = trap_message(catch_unwind(AssertUnwindSafe(|| {
+        StellarVerifier::verify_risc0_receipt(
+            env.clone(),
+            BytesN::from_array(&env, &hex_bytes(&f["image_id"]).try_into().unwrap()),
+            Bytes::from_slice(&env, &hex_bytes(&f["journal"])),
+            Bytes::from_slice(&env, &seal),
+            BytesN::from_array(&env, &hex_bytes(&f["control_root"]).try_into().unwrap()),
+            BytesN::from_array(&env, &hex_bytes(&f["bn254_control_id"]).try_into().unwrap()),
+        )
+    })));
+    assert!(
+        is_subgroup_rejection(&generic),
+        "generic entry must abort with the host's G2 subgroup rejection, got: {generic}"
+    );
+
+    // Not a blanket failure: the genuine seal still verifies afterwards.
+    assert!(pinned_verdict(&Env::default(), &hex_bytes(&f["seal"])));
+}
+
+/// The boundary of that change: `b` defects the decoder *can* see — off the
+/// curve, the identity, a non-canonical coordinate — must keep returning
+/// `false` and must not reach the host. Only the wrong-subgroup case above is
+/// allowed to abort.
+#[test]
+fn other_malformed_b_still_returns_false_without_trapping() {
+    use ark_ff::{BigInteger, PrimeField};
+    let env = Env::default();
+    let genuine_b: [u8; 128] = hex_bytes(&risc0_fixture()["seal"])[64..192].try_into().unwrap();
+
+    let mut off_curve = genuine_b;
+    off_curve[127] ^= 1; // y.c0, low bit: still canonical, no longer on the curve
+    assert!(!pinned_verdict(&env, &fixture_seal_with_b(&off_curve)), "off-curve b");
+
+    assert!(
+        !pinned_verdict(&env, &fixture_seal_with_b(&[0u8; 128])),
+        "identity b"
+    );
+
+    let mut non_canonical = genuine_b;
+    non_canonical[..32].copy_from_slice(&ark_bn254::Fq::MODULUS.to_bytes_be()); // x.c1 == p
+    assert!(
+        !pinned_verdict(&env, &fixture_seal_with_b(&non_canonical)),
+        "non-canonical b"
+    );
+
+    // And the unmodified seal verifies, so the negatives are rejections.
+    assert!(pinned_verdict(&env, &fixture_seal_with_b(&genuine_b)));
+}

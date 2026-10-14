@@ -50,4 +50,4 @@ extern crate alloc;
 
 pub use bn254::{Fr, G1, G2};
 pub use groth16::{Proof, VerifyingKey};
-pub use ops::ProofOps;
+pub use ops::{HostChecksG2Subgroup, ProofOps};

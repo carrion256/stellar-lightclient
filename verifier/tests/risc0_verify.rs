@@ -355,6 +355,68 @@ fn seal_round_trips_through_parse() {
     assert_eq!(proof.c, vk.ic[5]);
 }
 
+/// The Soroban decoder defers exactly one check to the host: `b`'s membership
+/// in the prime-order subgroup. Everything else must still be rejected *here*,
+/// because anything the decoder lets through reaches a host that traps on it —
+/// so the set of seals that can trap must be exactly {on-curve, canonical,
+/// finite `b` outside the subgroup}, not "any malformed seal".
+#[test]
+fn host_checked_decoder_defers_only_the_g2_subgroup_check() {
+    use groth16_core::risc0::seal_to_proof_host_checked as host_checked;
+
+    let vk = risc0::verifying_key();
+    let genuine = {
+        let mut seal = vec![0u8; 256];
+        encode_g1_into(&vk.alpha_g1, &mut seal[0..64]);
+        encode_g2_into(&vk.beta_g2, &mut seal[64..192]);
+        encode_g1_into(&vk.ic[5], &mut seal[192..256]);
+        seal
+    };
+    assert!(risc0::seal_to_proof(&genuine).is_ok());
+    assert!(host_checked(&genuine).is_ok(), "a valid seal decodes both ways");
+
+    // The one deferred case: on-curve, canonical, finite, wrong subgroup.
+    let mut deferred = genuine.clone();
+    encode_g2_into(&wrong_subgroup_g2(), &mut deferred[64..192]);
+    assert!(
+        risc0::seal_to_proof(&deferred).is_err(),
+        "the fully checked decoder must reject a wrong-subgroup b"
+    );
+    assert!(
+        host_checked(&deferred).is_ok(),
+        "the host-checked decoder must leave it to the host"
+    );
+
+    // Every other defect is still the decoder's to reject.
+    let rejects = |name: &str, seal: &[u8]| {
+        assert!(host_checked(seal).is_err(), "{name}: must be rejected before the host");
+        assert!(risc0::seal_to_proof(seal).is_err(), "{name}: strict decoder agrees");
+    };
+
+    let mut off_curve_b = genuine.clone();
+    off_curve_b[64 + 127] ^= 1; // y.c0, low bit: stays canonical, leaves the curve
+    rejects("off-curve b", &off_curve_b);
+
+    let mut identity_b = genuine.clone();
+    identity_b[64..192].fill(0);
+    rejects("identity b", &identity_b);
+
+    let mut non_canonical_b = genuine.clone();
+    non_canonical_b[64..96].copy_from_slice(&fq_modulus_be()); // x.c1 == p
+    rejects("non-canonical b", &non_canonical_b);
+
+    let mut off_curve_a = genuine.clone();
+    off_curve_a[63] ^= 1;
+    rejects("off-curve a", &off_curve_a);
+
+    let mut identity_c = genuine.clone();
+    identity_c[192..256].fill(0);
+    rejects("identity c", &identity_c);
+
+    rejects("short seal", &genuine[..255]);
+    rejects("long seal", &[genuine.as_slice(), &[0u8]].concat());
+}
+
 // ---------------------------------------------- group 4: public-input vectors
 
 #[test]

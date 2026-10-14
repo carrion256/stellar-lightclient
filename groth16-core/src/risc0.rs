@@ -10,7 +10,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use crate::bn254::{Fr, G1, G2, SCALAR_SIZE, SEAL_SIZE};
 use crate::groth16::{self, Proof, VerifyingKey};
-use crate::ops::ProofOps;
+use crate::ops::{HostChecksG2Subgroup, ProofOps};
 use ark_bn254::Fq;
 use ark_serialize::CanonicalDeserialize;
 
@@ -114,11 +114,57 @@ pub fn verify(ops: &impl ProofOps, proof: &CheckedProof, public_inputs: &[Fr; 5]
     groth16::verify_trusted_vk_prescreened(ops, &pinned_vk_unchecked(), &proof.0, public_inputs)
 }
 
+/// A [`Proof`] whose `a` and `c` are finite, on-curve and (G1 has cofactor 1,
+/// so on-curve implies it) in the prime-order subgroup, and whose `b` is
+/// canonical, finite and on-curve — but whose **subgroup membership is not
+/// checked**. The host's pairing is trusted to do that, which is why the only
+/// consumer, [`verify_host_checked`], demands a [`HostChecksG2Subgroup`]
+/// provider.
+///
+/// Distinct from [`CheckedProof`] on purpose: the two carry different
+/// guarantees, and a `b` that is on-curve but in the wrong subgroup is a valid
+/// `HostCheckedProof` that **traps** the host rather than verifying `false`.
+#[derive(Clone, Debug)]
+pub struct HostCheckedProof(Proof);
+
+/// [`verify`] for a [`HostCheckedProof`]: the same pinned-key Groth16 check,
+/// with the G2 subgroup multiplication left to the provider's `pairing_check`
+/// (the host does it natively for ~1.7M CPU against ~83M in wasm).
+///
+/// Soundness is unchanged — a wrong-subgroup `b` cannot reach `true`, because
+/// [`HostChecksG2Subgroup`] providers abort on it. What changes is the failure
+/// mode: **such an input traps the transaction instead of returning `false`.**
+/// Every other malformed seal still returns `false` from the decoder.
+pub fn verify_host_checked(
+    ops: &impl HostChecksG2Subgroup,
+    proof: &HostCheckedProof,
+    public_inputs: &[Fr; 5],
+) -> bool {
+    groth16::verify_trusted_vk_prescreened(ops, &pinned_vk_unchecked(), &proof.0, public_inputs)
+}
+
 /// Decode a raw 256-byte RISC Zero seal into a [`CheckedProof`].
 ///
 /// Every point is rejected unless it is canonically encoded, finite,
 /// on-curve and in the prime-order subgroup (`g1_from_be_raw` /
 /// `g2_from_be_raw`), which is what makes the result a [`CheckedProof`].
+///
+/// See [`decode_seal`] for the byte layout.
+pub fn seal_to_proof(seal: &[u8]) -> Result<CheckedProof, String> {
+    decode_seal(seal, true).map(CheckedProof)
+}
+
+/// Like [`seal_to_proof`], but `b`'s prime-order-subgroup check is skipped and
+/// left to the host (see [`HostCheckedProof`]). Everything else — length,
+/// canonical encoding, on-curve, finite — is still rejected here, so the *only*
+/// seal this accepts and [`seal_to_proof`] rejects is an on-curve `b` outside
+/// the subgroup.
+pub fn seal_to_proof_host_checked(seal: &[u8]) -> Result<HostCheckedProof, String> {
+    decode_seal(seal, false).map(HostCheckedProof)
+}
+
+/// Seal parser shared by both decoders; `check_b_subgroup` is the only
+/// difference between them.
 ///
 /// Layout (risc0-groth16-3.0.5/src/types.rs:69-103 `Seal::decode`):
 /// - `a`: bytes 0..64, G1 as `(x_BE, y_BE)`.
@@ -128,7 +174,7 @@ pub fn verify(ops: &impl ProofOps, proof: &CheckedProof, public_inputs: &[Fr; 5]
 ///   (risc0-groth16-3.0.5/src/lib.rs:118-132; swap introduced in
 ///   src/types.rs:117-120). We un-swap here so `Proof.b` is the real G2 point.
 /// - `c`: bytes 192..256, G1 as `(x_BE, y_BE)`.
-pub fn seal_to_proof(seal: &[u8]) -> Result<CheckedProof, String> {
+fn decode_seal(seal: &[u8], check_b_subgroup: bool) -> Result<Proof, String> {
     // `Seal::SIZE` is `a(G1) ‖ b(G2) ‖ c(G1)`; the source returns an error on a
     // wrong length, so do the same. Sizes come from the shared layout rather
     // than magic numbers, so this and the encoders cannot drift apart.
@@ -151,12 +197,12 @@ pub fn seal_to_proof(seal: &[u8]) -> Result<CheckedProof, String> {
         seal.get(i * SCALAR_SIZE..(i + 1) * SCALAR_SIZE)
             .ok_or_else(|| "seal: truncated field element".into())
     };
-    Ok(CheckedProof(Proof {
+    Ok(Proof {
         a: g1_from_be_raw([e(0)?, e(1)?]).map_err(|_| "seal a: invalid G1 point")?,
-        b: g2_from_be_raw([[e(2)?, e(3)?], [e(4)?, e(5)?]])
+        b: g2_from_be_raw([[e(2)?, e(3)?], [e(4)?, e(5)?]], check_b_subgroup)
             .map_err(|_| "seal b: invalid G2 point")?,
         c: g1_from_be_raw([e(6)?, e(7)?]).map_err(|_| "seal c: invalid G1 point")?,
-    }))
+    })
 }
 
 /// The `control_root` of the RISC Zero release this crate's pinned verifying key
@@ -294,9 +340,14 @@ fn g1_from_be_raw(elem: [&[u8]; 2]) -> Result<G1, ()> {
 /// source order `elem[0][1], elem[0][0], elem[1][1], elem[1][0]`, so the real
 /// point is `(x = Fq2(c0 = elem[0][1], c1 = elem[0][0]),
 /// y = Fq2(elem[1][1], elem[1][0]))`. Each component is parsed strictly as
-/// `Fq`, then the point is checked on-curve, in the prime-order subgroup, and
-/// non-identity.
-fn g2_from_be_raw(elem: [[&[u8]; 2]; 2]) -> Result<G2, ()> {
+/// `Fq`, then the point is checked on-curve, non-identity and — unless
+/// `check_subgroup` is false — in the prime-order subgroup.
+///
+/// `check_subgroup = false` exists for exactly one caller, the
+/// [`HostChecksG2Subgroup`] path of [`seal_to_proof_host_checked`]; the
+/// subgroup multiplication is the single largest wasm-side cost of a receipt
+/// verification. Every other caller (the VK, [`seal_to_proof`]) passes `true`.
+fn g2_from_be_raw(elem: [[&[u8]; 2]; 2], check_subgroup: bool) -> Result<G2, ()> {
     let c = [
         fq_be_raw(elem[0][1]),
         fq_be_raw(elem[0][0]),
@@ -311,7 +362,10 @@ fn g2_from_be_raw(elem: [[&[u8]; 2]; 2]) -> Result<G2, ()> {
         ark_bn254::Fq2 { c0, c1 },
         ark_bn254::Fq2 { c0: c2, c1: c3 },
     );
-    if p.infinity || !p.is_on_curve() || !p.is_in_correct_subgroup_assuming_on_curve() {
+    if p.infinity || !p.is_on_curve() {
+        return Err(());
+    }
+    if check_subgroup && !p.is_in_correct_subgroup_assuming_on_curve() {
         return Err(());
     }
     Ok(p)
@@ -329,16 +383,19 @@ fn g1_from_be(xs: [&str; 2]) -> Result<G1, String> {
 }
 
 fn g2_from_be(ys: [[&str; 2]; 2]) -> Result<G2, String> {
-    g2_from_be_raw([
+    g2_from_be_raw(
         [
-            &u256_dec_to_be32(ys[0][0]).ok_or("G2 e00 out of range")?,
-            &u256_dec_to_be32(ys[0][1]).ok_or("G2 e01 out of range")?,
+            [
+                &u256_dec_to_be32(ys[0][0]).ok_or("G2 e00 out of range")?,
+                &u256_dec_to_be32(ys[0][1]).ok_or("G2 e01 out of range")?,
+            ],
+            [
+                &u256_dec_to_be32(ys[1][0]).ok_or("G2 e10 out of range")?,
+                &u256_dec_to_be32(ys[1][1]).ok_or("G2 e11 out of range")?,
+            ],
         ],
-        [
-            &u256_dec_to_be32(ys[1][0]).ok_or("G2 e10 out of range")?,
-            &u256_dec_to_be32(ys[1][1]).ok_or("G2 e11 out of range")?,
-        ],
-    ])
+        true,
+    )
     .map_err(|_| "g2 point invalid".to_string())
 }
 

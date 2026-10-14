@@ -151,12 +151,18 @@ pub fn verify_trusted_vk(
     verify_trusted_vk_prescreened(ops, vk, proof, public_inputs)
 }
 
-/// [`verify_trusted_vk`] minus the proof-side guards, for a proof that has
-/// *already* passed them: shape/degeneracy, on-curve, prime-order subgroup.
-/// The only such proof is a [`crate::risc0::CheckedProof`], which
-/// [`crate::risc0::seal_to_proof`] mints after the decoder has applied those
-/// checks — repeating them here ran the G2 subgroup multiplication twice per
-/// receipt, the single largest wasm-side cost of the verifiers.
+/// [`verify_trusted_vk`] minus the proof-side guards, for a proof whose points
+/// are already known valid. Two types mint that knowledge, through
+/// [`crate::risc0::seal_to_proof`] and [`crate::risc0::seal_to_proof_host_checked`]:
+///
+/// * a [`crate::risc0::CheckedProof`] has passed *every* guard — shape,
+///   on-curve, prime-order subgroup — so repeating them here ran the G2
+///   subgroup multiplication twice per receipt, the single largest wasm-side
+///   cost of the verifiers;
+/// * a [`crate::risc0::HostCheckedProof`] has passed all but `b`'s subgroup
+///   check, which it leaves to the provider — reachable only through
+///   [`crate::ops::HostChecksG2Subgroup`], whose `pairing_check` aborts on a
+///   wrong-subgroup operand instead of accepting it.
 ///
 /// Crate-private on purpose: a raw [`Proof`] reaching the host unchecked
 /// **traps** it (NEAR `AltBn128InvalidInput`; the Soroban host likewise), so

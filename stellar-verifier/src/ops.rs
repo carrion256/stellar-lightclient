@@ -33,6 +33,13 @@
 //! `p < 2^254 < 0x80…`), and the on-curve/subgroup guards stay in
 //! `groth16_core::groth16::verify`, which runs them *before* any host call.
 //!
+//! One deliberate exception: the RISC Zero receipt path
+//! (`groth16_core::risc0::verify_host_checked`) leaves the proof's G2 `b`
+//! *subgroup* check to the host, which does it natively and aborts on failure
+//! — see the [`groth16_core::ops::HostChecksG2Subgroup`] impl below. That
+//! single input class traps instead of returning `false`; the on-curve,
+//! identity and canonical-encoding guards still run first.
+//!
 //! Total-ness follows the contract in `groth16-core/src/ops.rs`: an empty
 //! multi-scalar multiplication returns the identity without a host call, an
 //! empty pairing check returns `true` without a host call (the host's
@@ -234,6 +241,29 @@ impl ProofOps for SorobanBn254 {
         env.crypto().bn254().pairing_check(vp1, vp2)
     }
 }
+
+// The Soroban host's `pairing_check` validates every G2 operand in full and
+// aborts the transaction on a failure — established by reading the pinned
+// host (soroban-env-host 28.0.2, the version in this crate's Cargo.lock), not
+// by trusting the SDK docs alone:
+//
+// * `host.rs:3321` — the pairing host function builds its G2 operands with
+//   `bn254_checked_g2_vec_from_vecobj`;
+// * `crypto/bn254.rs:429-448` — which runs every element through
+//   `bn254_g2_affine_deserialize`;
+// * `crypto/bn254.rs:255-303` — which rejects non-canonical field elements,
+//   points off the curve (292-296) and points outside the prime-order
+//   subgroup (298-302) with `bn254_err_invalid_input`.
+//
+// The SDK states the same contract (`soroban-sdk` 28.0.0 `crypto/bn254.rs:65`:
+// "Points must be on the curve AND in the correct subgroup"). Re-read those
+// host lines on any soroban-env-host bump before keeping this impl.
+//
+// What it buys: `risc0::verify_host_checked` skips the ~83M-instruction wasm
+// G2 subgroup multiplication for the proof's `b`, the host doing the same
+// check natively for ~1.7M. What it costs: a `b` that is on-curve but outside
+// the subgroup traps the transaction instead of verifying `false`.
+impl groth16_core::ops::HostChecksG2Subgroup for SorobanBn254 {}
 
 #[cfg(test)]
 mod tests {

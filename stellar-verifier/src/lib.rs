@@ -176,7 +176,22 @@ impl StellarVerifier {
     /// `verify_risc0_receipt_pinned` performs that comparison for you, inside
     /// the contract.
     ///
-    /// Malformed input returns `false`; never traps.
+    /// # Failure modes
+    ///
+    /// Malformed input returns `false` — wrong seal length, a non-canonical
+    /// coordinate, an off-curve or identity point, non-canonical public
+    /// inputs — with **one exception: a `b` point that is on the curve but
+    /// outside the prime-order subgroup traps the transaction.** The G2
+    /// subgroup check is left to the host's `pairing_check`
+    /// (`groth16_core::ops::HostChecksG2Subgroup`, citations at
+    /// `ops::SorobanBn254`), which costs ~1.7M CPU instructions there against
+    /// ~83M in wasm, and the host aborts rather than returning `false`.
+    ///
+    /// Soundness is unaffected: such a seal can never verify `true`. A caller
+    /// that requires `true` sees no difference (both outcomes abort its
+    /// transaction). A caller that handles `false` itself — a fallback path, a
+    /// loop over untrusted receipts — has its whole transaction aborted by one
+    /// such seal, and Soroban has no way to catch it from inside a contract.
     pub fn verify_risc0_receipt(
         env: Env,
         image_id: BytesN<32>,
@@ -193,7 +208,7 @@ impl StellarVerifier {
         let mut journal_buf = alloc::vec![0u8; journal.len() as usize];
         journal.copy_into_slice(&mut journal_buf);
         let journal = journal_buf.as_slice();
-        let claim = groth16_core::claim::ok_claim(&ops, image_id.to_array(), &journal);
+        let claim = groth16_core::claim::ok_claim(&ops, image_id.to_array(), journal);
         let digest = groth16_core::claim::claim_digest(&ops, &claim);
         let Ok(public_inputs) = groth16_core::risc0::public_inputs(
             control_root.to_array(),
@@ -205,10 +220,10 @@ impl StellarVerifier {
         let Ok(seal) = <[u8; SEAL_SIZE]>::try_from(seal) else {
             return false;
         };
-        let Ok(proof) = groth16_core::risc0::seal_to_proof(&seal) else {
+        let Ok(proof) = groth16_core::risc0::seal_to_proof_host_checked(&seal) else {
             return false;
         };
-        groth16_core::risc0::verify(&ops, &proof, &public_inputs)
+        groth16_core::risc0::verify_host_checked(&ops, &proof, &public_inputs)
     }
 
     /// Pinned companion of [`verify_risc0_receipt`]: the control constants
@@ -222,6 +237,9 @@ impl StellarVerifier {
     /// Receipts from any other wrapper build verify `false` here. Callers
     /// deliberately targeting a different RISC Zero release use
     /// [`verify_risc0_receipt`] and pin the pair themselves.
+    ///
+    /// Failure modes are exactly those of [`verify_risc0_receipt`], including
+    /// the trap on an on-curve, wrong-subgroup `b`.
     pub fn verify_risc0_receipt_pinned(
         env: Env,
         image_id: BytesN<32>,

@@ -106,6 +106,19 @@ transaction rather than returning `false`, so never add a path that builds a
 `CheckedProof` without the decoder, and verify a raw `Proof` through
 `groth16::verify_trusted_vk`, which keeps every guard.
 
+The Soroban contract goes one step further: `seal_to_proof_host_checked` skips
+the proof's G2 `b` **subgroup** check too, and `verify_host_checked` hands `b` to
+the host's `pairing_check`, which validates every G2 operand (canonical, on-curve,
+in-subgroup) and aborts on failure. Only a provider implementing the
+`HostChecksG2Subgroup` marker can call it, so the NEAR provider cannot. Cost of
+the deferral: an on-curve, wrong-subgroup `b` **traps** the Soroban transaction
+instead of returning `false` (every other malformed seal still returns `false`
+from the decoder); soundness is unaffected because the host rejects it before any
+verdict. The marker's justification is a reading of the pinned host source
+(`soroban-env-host` `host.rs:3321`, `crypto/bn254.rs:255-303,429-448`, cited at
+`stellar-verifier/src/ops.rs`) — re-read it on any `soroban-env-host` bump, and
+never implement the marker for a provider whose pairing accepts unchecked G2.
+
 The Docker guest builder needs network access to crates.io. For a locally
 installed `risc0` toolchain, the Nix shell's `rustc` must not shadow that
 toolchain during a native guest build:

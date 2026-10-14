@@ -53,3 +53,21 @@ pub trait ProofOps {
     /// mismatched slice.
     fn pairing_check(&self, pairs: &[(G1, G2)]) -> bool;
 }
+
+/// Marker for a [`ProofOps`] provider whose [`pairing_check`](ProofOps::pairing_check)
+/// validates **every** G2 operand itself — canonical field elements, on the
+/// curve, *and* in the prime-order subgroup — and aborts the transaction on
+/// one that is not (rather than, say, only checking the curve equation).
+///
+/// That guarantee is what lets a verifier hand the host a G2 point whose
+/// subgroup membership it has *not* checked: the host's check is the
+/// soundness backstop, so a wrong-subgroup point can never reach a `true`
+/// verdict, it can only abort. The price is the failure mode — such an input
+/// traps instead of returning `false` — which is why the unchecked path
+/// ([`crate::risc0::verify_host_checked`]) is only reachable through this
+/// trait and the fully checked [`crate::risc0::verify`] stays total.
+///
+/// Implement it only after reading the host's G2 deserializer, never on
+/// inference. Soroban qualifies (citations at its impl); do **not** implement
+/// it for a provider whose pairing accepts unvalidated G2 points.
+pub trait HostChecksG2Subgroup: ProofOps {}
